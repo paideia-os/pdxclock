@@ -1,0 +1,151 @@
+// src/argv.pdx — pdxclock v0.5.0 (R102.M1-002, paideia-os/pdxclock#2)
+//
+// Argv module: minimal `--x=<pos>` / `--y=<pos>` parser for the
+// window's initial placement. No libpdx-argv link at v0.5.0 (pdxclock
+// takes exactly two optional flags and needs none of libpdx-argv's
+// --help/--version machinery); argv is read directly off the frozen
+// execve ABI (rdi = argc, rsi = argv, argv[0] = program name) per
+// paideia-os design/user/execve-abi.md, the same convention
+// tools/user/mkdir/src/mkdir.pdx uses.
+//
+// Contract
+// --------
+//   pdxclock [--x=<u64>] [--y=<u64>]
+//
+// Both default to 0 (top-left placement) when absent, per
+// R102.M1-002's scope ("defaults 0,0"). Unrecognized flags and bare
+// positionals are silently ignored — pdxclock has no other options to
+// reject them against, and a hard failure on an unknown flag would
+// make future flag additions a breaking change for scripts that
+// already pass them.
+//
+// Decimal parsing is bounded to 5 digits (max value 99999) and stops
+// at the first non-digit byte (including a missing digit — `--x=`
+// alone leaves the field at 0, its just-reset default). No 2-op
+// `imul`: the running total is scaled by 10 via `shl`+`shl`+`add`
+// (val*8 + val*2) per feedback_pdx_encoder_pitfalls.
+//
+// paideia-as compliance: module basename PascalCase (`Argv`); no
+// `test rN,rN` (every zero-check is `cmp reg, 0`); no `and rN, imm64`
+// on r8-r15 (none used); no 2-op `imul`; every `cmp` immediate fits
+// imm8. Labels prefixed `av_` to dodge reserved keywords (`loop`,
+// `if`, `let`). Leaf: no `syscall`, no nested `call` — no prologue
+// needed regardless of entry rsp%16.
+
+module Argv = structure {
+
+  // Parsed placement, defaulting to (0, 0). Plain writable .data
+  // (not `uninit` .bss) so the zero default is explicit and visible
+  // at the declaration site rather than relying on loader BSS-zero
+  // convention.
+  pub let mut _argv_x : u64 = 0
+  pub let mut _argv_y : u64 = 0
+
+  // argv_parse(argc, argv) -> ()
+  //
+  // Walks argv[1..argc]. For each entry, a 4-byte literal compare
+  // against "--x=" (0x2D,0x2D,0x78,0x3D) or "--y=" (…,0x79,…)
+  // classifies the flag; a bounded decimal scan over the remaining
+  // bytes (stopping at NUL or the first non-digit, capped at 5
+  // digits) fills the accumulator, which is stored to _argv_x or
+  // _argv_y on completion. Register plan: rcx = argv index i, r8 =
+  // argv[i] pointer, r9 = decimal accumulator, r10 = shift-add
+  // scratch, r11 = digit-count guard, rdx = .bss lea scratch, rax =
+  // per-byte load. rdi/rsi hold argc/argv for the outer loop's whole
+  // run (never spilled — no nested call touches them). r11/rdx are
+  // caller-saved scratch (not SysV callee-save) and this function
+  // issues no `syscall`, so neither the callee-save-preservation
+  // question nor the SYSCALL rcx/r11 clobber applies here.
+  pub let argv_parse : (u64, u64) -> () !{mem} @{} =
+    fn (argc: u64, argv: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "pdxclock.M1-002 (#2) argv_parse: rdi=argc, rsi=argv per the frozen execve ABI. rcx=i starts at 1 (skip argv[0]). av_top: cmp rcx,rdi; jge av_done (i>=argc ends the walk). r8 = [rsi+rcx*8] (argv[i]). Four mov_b+cmp compares against '-','-', then 'x' (0x78) or 'y' (0x79) branch, then '=' classify the flag; any mismatch falls to av_next (unclassified argv entries are ignored, not rejected). On a match, av_parse_num scans r8+r11*1+4 onward: xor rax,rax; mov_b rax,[r8+r11*1+4]; cmp rax,0; je av_store (NUL ends the field); cmp rax,0x30; jl av_store; cmp rax,0x39; jg av_store (non-digit ends the field, matches getcwd-style early-stop discipline elsewhere in the tree); sub rax,0x30; mov r10,r9; shl r9,3; shl r10,1; add r9,r10; add r9,rax (r9 = r9*10 + digit, via shift-add — no imul); inc r11; cmp r11,5; jl av_parse_num else av_store (5-digit cap, matches the 99999 bound documented at the header). av_store writes r9 into _argv_x or _argv_y (via `lea rdx, [rip + _argv_x|_argv_y]; mov [rdx], r9`) per which literal matched, then falls to av_next which increments rcx and repeats. All cmp immediates (0x2D/0x78/0x79/0x3D/0x30/0x39/0/5) fit imm8. No test rN,rN — every zero/bound check is cmp reg,imm. No and rN,imm64. No 2-op imul. Leaf: no syscall, no nested call, so no prologue/epilogue, no rsp%16 concern, and no callee-save obligation for r8-r11/rdx. Labels prefixed av_.",
+      block: {
+        mov rcx, 1;                          // i = 1 (skip argv[0])
+
+      av_top:
+        cmp rcx, rdi;
+        jge av_done;
+
+        mov r8, [rsi + rcx*8];                // r8 = argv[i]
+
+        // ---- classify: "--x=" or "--y=" ---------------------------
+        xor rax, rax;
+        mov_b rax, [r8 + 0];
+        cmp rax, 0x2D;                        // '-'
+        jne av_next;
+        xor rax, rax;
+        mov_b rax, [r8 + 1];
+        cmp rax, 0x2D;                        // '-'
+        jne av_next;
+        xor rax, rax;
+        mov_b rax, [r8 + 2];
+        cmp rax, 0x78;                        // 'x'
+        je  av_is_x;
+        cmp rax, 0x79;                        // 'y'
+        je  av_is_y;
+        jmp av_next;
+
+      av_is_x:
+        xor rax, rax;
+        mov_b rax, [r8 + 3];
+        cmp rax, 0x3D;                        // '='
+        jne av_next;
+        xor r9, r9;
+        xor r11, r11;
+        jmp av_parse_num;
+
+      av_is_y:
+        xor rax, rax;
+        mov_b rax, [r8 + 3];
+        cmp rax, 0x3D;                        // '='
+        jne av_next;
+        xor r9, r9;
+        xor r11, r11;
+        // fall through: shared scanner below; distinguished at av_store
+        // by re-testing [r8+2] rather than a separate flag byte.
+        jmp av_parse_num;
+
+      av_parse_num:
+        xor rax, rax;
+        mov_b rax, [r8 + r11*1 + 4];
+        cmp rax, 0;
+        je  av_store;
+        cmp rax, 0x30;
+        jl  av_store;
+        cmp rax, 0x39;
+        jg  av_store;
+        sub rax, 0x30;
+        mov r10, r9;
+        shl r9, 3;                            // r9 * 8
+        shl r10, 1;                           // r10 * 2
+        add r9, r10;                          // r9 = r9*10
+        add r9, rax;                          // r9 += digit
+        inc r11;
+        cmp r11, 5;
+        jl  av_parse_num;
+        jmp av_store;
+
+      av_store:
+        xor rax, rax;
+        mov_b rax, [r8 + 2];
+        cmp rax, 0x78;                        // 'x' -> _argv_x
+        jne av_store_y;
+        lea rdx, [rip + _argv_x];
+        mov [rdx], r9;
+        jmp av_next;
+
+      av_store_y:
+        lea rdx, [rip + _argv_y];
+        mov [rdx], r9;
+
+      av_next:
+        inc rcx;
+        jmp av_top;
+
+      av_done:
+        ret
+      }
+    }
+}

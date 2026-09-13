@@ -1,0 +1,71 @@
+// src/pdxclock.pdx — pdxclock v0.5.0 entry point
+//
+// Pdxclock module: `_start`. Ties together Argv::argv_parse,
+// Window::window_open, and the Render/Close per-tick pair into the
+// smallest-useful-window-app loop design/graphics/r102-user-plan.md
+// §2.7 describes.
+//
+// Sequence
+// --------
+//   1. argv_parse(argc, argv) -> _argv_x / _argv_y (default 0,0).
+//   2. window_open(_argv_x, _argv_y). On failure (fail-closed, I4
+//      posture — expected at v0.5.0 until svc-compositor registers;
+//      see src/window.pdx's header), emit a one-line diagnostic on
+//      the debug channel and sys_exit(rax) with the propagated
+//      -errno verbatim.
+//   3. Loop forever: render_run_tick() (renders + enforces the 1 Hz
+//      cadence via its own internal busy-wait) then close_poll()
+//      (never returns if a CLOSING WindowRecord was seen — calls
+//      sys_exit(0) itself).
+//
+// paideia-as compliance: module basename PascalCase (`Pdxclock`); no
+// `test rN,rN`; no `and rN, imm64` on r8-r15; no 2-op `imul`; every
+// `cmp` immediate fits imm8. @no_frame — every path either loops
+// forever or ends in a callee's sys_exit; there is no return edge to
+// preserve callee-save state for. Labels prefixed `pc_` (avoids the
+// reserved `loop`/`if`).
+
+module Pdxclock = structure {
+
+  pub let err_window_open_msg : [u8; 29] = "pdxclock: window open failed\0"
+  pub let err_window_open_len : u64 = 28
+
+  pub let _start : () -> () !{mem, sysreg} @{cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap, sched},
+      justification: "pdxclock.M1-002/M2-001/M3-001 (#2/#3/#4) _start. Entry rsp%16==0 per the PVH loader contract (design/user/execve-abi.md: 'rsp % 16 == 0 at _start entry') -- that is ALREADY the alignment a `call` instruction needs immediately before it fires (the callee then sees entry rsp%16==8, the convention every OTHER function in this tree, e.g. Window::window_open, documents for itself), so unlike an ordinary nested function this _start needs NO push/sub pad at all: the very first `call argv_parse` fires at the untouched entry alignment, and every later call site is preceded only by straight-line non-stack-touching code (lea/mov register loads) or by a RETURNED-FROM prior call -- `call`/`ret` pairs are stack-neutral, so rsp%16 is back to 0 after each one. Step 1: rdi/rsi already hold argc/argv verbatim from the kernel's execve handoff, so `call argv_parse` needs no register setup. Step 2: lea rdi=&_argv_x-loaded-value / rsi=&_argv_y-loaded-value (two lea+mov pairs fetch the parsed placement into rdi/rsi immediately before the call, since argv_parse's writes are the only way those globals get a non-zero value); `call window_open`. cmp rax,0; jl pc_open_fail. pc_open_fail: r8 = rax (the -errno, cached across the debug_puts call since sys_debug_puts clobbers rax); emit err_window_open_msg (sys_debug_puts, sysno 12); mov rdi, r8; mov rax, 60; syscall (sys_exit(-errno) verbatim, mkdir precedent). pc_loop: call render_run_tick; call close_poll; jmp pc_loop -- infinite; close_poll itself exits the process on WindowRecord CLOSING and never returns in that case. @no_frame: no path here falls off the end of the function. No test rN,rN. No and rN,imm64. No 2-op imul. All cmp/mov immediates besides err_window_open_len(28)/60/12 are register-to-register. Labels prefixed pc_.",
+      block: {
+        // ---- argv_parse(argc, argv) ---------------------------------
+        // rdi = argc, rsi = argv verbatim from the execve handoff --
+        // no setup needed before this first call.
+        call argv_parse;
+
+        // ---- window_open(_argv_x, _argv_y) --------------------------
+        lea rax, [rip + _argv_x];
+        mov rdi, [rax];
+        lea rax, [rip + _argv_y];
+        mov rsi, [rax];
+        call window_open;
+        cmp rax, 0;
+        jl  pc_open_fail;
+        jmp pc_loop;
+
+      pc_open_fail:
+        mov r8, rax;                           // save -errno across debug_puts
+        lea rdi, [rip + err_window_open_msg];
+        mov rsi, 28;                            // err_window_open_len
+        mov rax, 12;
+        syscall;
+        mov rdi, r8;                            // -errno passthrough
+        mov rax, 60;
+        syscall;
+        hlt;                                    // unreachable
+
+      pc_loop:
+        call render_run_tick;
+        call close_poll;
+        jmp pc_loop
+      }
+    } @no_frame
+}

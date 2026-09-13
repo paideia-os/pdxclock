@@ -1,0 +1,111 @@
+# pdxclock — manifest.pdxsig
+#
+# Dual-signed package manifest source-form for `pdxclock` v0.5.0.
+#
+# Wave:  R102 (design/graphics/r102-user-plan.md, paideia-os monorepo)
+# Doc:   design/tooling/plan.md §D4 + §6.2-§6.4 for the two-key
+#        ML-DSA-65 dual-signature shape this manifest follows
+#        (author key + Paideia root re-sign key).
+#
+# Substrate posture (2026-09-13, same gate every other satellite repo
+# in this org records — see e.g. tools/user/cat/manifest.pdxsig):
+# the ml_dsa_65_{sign,verify} intrinsic + sha3-256 primitive
+# (paideia-as v0.33-crypto), the svc.signing-bot broker registration,
+# and the pkgs.paideia-os host are all still pending T-INFRA-001/002.
+# Every `signature_ml_dsa_65:` / `signer_pk_id:` field below therefore
+# carries the literal `PENDING`, and content hashes use interim
+# sha2-256 rather than the eventual on-wire sha3-256.
+#
+# This is a pre-1.0 (v0.5.0) landing — R102.M5-001 ("signed 1.0.0
+# release", paideia-os/pdxclock's own M5 issue, not yet filed in this
+# batch) is where a real signed manifest first ships. This file exists
+# now, at v0.5.0, per R102.M1-001's own scope note naming
+# "manifest.pdxsig source-form" as part of the repo scaffold.
+
+# ---------------------------------------------------------------
+# §1 Package identity
+# ---------------------------------------------------------------
+package:
+  name:              pdxclock
+  version:           0.5.0
+  wave:              R102 (M1-001 .. M4-001)
+  category:          G  # Graphical userland (r102-user-plan.md app catalogue)
+  release_date:      2026-09-13
+  git_tag:           v0.5.0
+  git_repo:          github.com/paideia-os/pdxclock
+  license:           MIT
+  paideia_as_target: v0.21          # min toolchain per tools/build.sh's own floor
+
+# ---------------------------------------------------------------
+# §2 Capability manifest reference (I6)
+# ---------------------------------------------------------------
+caps_decl:
+  path:              caps.decl
+  hash_sha2_256:     TBD-RECOMPUTED-AT-SIGN
+  # hash_sha3_256:  <re-emitted by paideia-as release --sign>
+
+# ---------------------------------------------------------------
+# §3 Dependency manifest reference
+# ---------------------------------------------------------------
+# No deps.list at v0.5.0 -- pdxclock links no shared library yet.
+# svc_lookup/ipc_send/ipc_recv are inline syscall trampolines
+# (src/window.pdx), matching tools/user/mv's own posture before its
+# libpdx-argv adoption.
+deps_list:
+  path:              (none)
+
+# ---------------------------------------------------------------
+# §4 Content hashes over the shipped tree
+# ---------------------------------------------------------------
+content_hashes:
+  algorithm:         sha2-256          # interim; on-wire uses sha3-256
+  entries:
+    - path: LICENSE
+      hash: TBD-RECOMPUTED-AT-SIGN
+    - path: caps.decl
+      hash: TBD-RECOMPUTED-AT-SIGN
+    - path: src/tool_ident.pdx
+      hash: TBD-RECOMPUTED-AT-SIGN
+    - path: src/argv.pdx
+      hash: TBD-RECOMPUTED-AT-SIGN
+    - path: src/window.pdx
+      hash: TBD-RECOMPUTED-AT-SIGN
+    - path: src/render.pdx
+      hash: TBD-RECOMPUTED-AT-SIGN
+    - path: src/close.pdx
+      hash: TBD-RECOMPUTED-AT-SIGN
+    - path: src/pdxclock.pdx
+      hash: TBD-RECOMPUTED-AT-SIGN
+    - path: tests/pdxclock_seeded_time_smoke.pdx
+      hash: TBD-RECOMPUTED-AT-SIGN
+
+# ---------------------------------------------------------------
+# §5 Declared output schemas
+# ---------------------------------------------------------------
+declared_output_schemas: (none)
+
+# ---------------------------------------------------------------
+# §6 Author signature — first of two ML-DSA-65 signatures
+# ---------------------------------------------------------------
+author_signature:
+  algorithm:         ML-DSA-65
+  signer:            paideia-os-team
+  signer_pk_id:      PENDING
+  signature_ml_dsa_65: PENDING
+
+# ---------------------------------------------------------------
+# §7 Root re-signature — second of two ML-DSA-65 signatures
+# ---------------------------------------------------------------
+root_signature:
+  algorithm:         ML-DSA-65
+  signer:            paideia_root_pk
+  signer_pk_id:      PENDING
+  signature_ml_dsa_65: PENDING
+  countersigned_by:  svc.signing-bot
+  countersigner_note: pending
+
+# ---------------------------------------------------------------
+# §8 Substrate-gate refusal witness
+# ---------------------------------------------------------------
+# `pkg install pdxclock` from this manifest MUST refuse until both
+# signature blocks carry non-PENDING bytes (exit 4, cap denied per I4).

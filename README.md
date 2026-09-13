@@ -28,13 +28,23 @@ Per the plan, this repo lands across five milestones:
 
 Every issue is filed against one of these five milestones; see the Issues tab.
 
-## Scaffolding
+## Status
 
-No code lands with this repo scaffold — scaffolding lives in the M1
-issues (`caps.decl`, `src/` skeleton, public API stubs, argv parsing).
-Repo shape mirrors R100 satellites: paideia-as manifest at root,
-`caps.decl` at root, `src/` module tree, `tests/`, `release/`,
-`doc/<name>.pdxdoc`, dual-signed `manifest.pdxsig` at 1.0.0.
+v0.5.0 lands M1-001 through M4-001: `caps.decl`, argv (`--x=`/`--y=`),
+window-open request against svc.compositor (`src/window.pdx`), the
+HH:MM:SS render loop (`src/render.pdx`), WindowRecord CLOSING handling
+(`src/close.pdx`), and the seeded-time regression
+(`tests/pdxclock_seeded_time_smoke.pdx`). svc-compositor, libpdx-gfx,
+libpdx-font, and libpdx-event are not yet landed satellites, so the
+window-open handshake speaks a documented provisional wire and the
+render "blit" is a WEAK debug-channel stub — see each file's header
+for the exact one-function swap a future landing needs. M4-002
+(close-on-WM-quit smoke) and M5-001 (signed 1.0.0 release) remain
+open.
+
+Repo shape mirrors R100 satellites: `caps.decl` at root, `src/` module
+tree, `tests/`, `manifest.pdxsig` (source-form; real signatures land
+at M5-001).
 
 ## License
 

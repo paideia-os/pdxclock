@@ -1,0 +1,222 @@
+// src/window.pdx — pdxclock v0.5.0 (R102.M1-002, paideia-os/pdxclock#2)
+//
+// Window module: requests a 128x48 ARGB32 KIND_SURFACE window from
+// svc.compositor at `--x=<pos> --y=<pos>` (defaults 0,0), and holds
+// the resulting endpoint + surface bookkeeping for src/render.pdx and
+// src/close.pdx.
+//
+// Substrate posture (2026-09-13)
+// -------------------------------
+// The kernel-side KIND_SURFACE cap (0x1B8) IS landed
+// (src/kernel/core/cap/kind_surface.pdx, R113.M1-001) and IS invoked
+// via the generic `cap_invoke` (SC+ 4) gate once a caller already
+// holds a KIND_IPC_ENDPOINT carrying R_SURFACE_MINT
+// (src/user/compositor/surface_kind.pdx §Section 1/4). But no
+// process in this workspace grants that per-connection mint right
+// yet — svc-compositor (design/graphics/r102-user-plan.md §3.4) and
+// its accept-loop / broker registration are themselves an unlanded
+// satellite repo, and neither `KIND_WINDOW` (the window-level cap
+// surface_kind.pdx's OP_MINT_WINDOW numbering anticipates) nor a
+// window manager exists to answer it.
+//
+// pdxclock therefore speaks a PROVISIONAL, pdxclock-local envelope
+// over plain IPC (svc_lookup + ipc_send + ipc_recv, SC+ 43/42/40 —
+// all three real, landed, uncapped-beyond-KIND_IPC_ENDPOINT
+// syscalls) rather than the real cap_invoke/KIND_SURFACE handshake:
+// look up "svc.compositor" by name, send a fixed-shape
+// PdxWindowOpenRequest, and read back a PdxWindowRecord reply. Until
+// svc-compositor registers under that name, `svc_lookup` fails with
+// -ESRCH and `window_open` propagates that failure to `_start`
+// (fail-closed, per invariant I4 posture) — this is the EXPECTED
+// v0.5.0 behaviour, not a bug. The swap to the real cap_invoke path
+// is confined to this file's body once svc-compositor.M3 lands a
+// real per-connection R_SURFACE_MINT endpoint (r102-user-plan.md
+// §3.4); every other module (render.pdx, close.pdx) only ever
+// consumes `_window_endpoint` / `_window_surface_slot` / `_window_kind`
+// and does not need to change.
+//
+// paideia-as compliance: module basename PascalCase (`Window`); no
+// `test rN,rN`; no `and rN, imm64` on r8-r15; no 2-op `imul`; no >4
+// curried args (ipc_send/ipc_recv trampolines below are exactly 4,
+// the ceiling); every `cmp` immediate fits imm32. Labels prefixed
+// `wnd_`. movabs (`mov r64, imm64`) used once for the 8-byte wire
+// tags, matching mkdir's schema-tag precedent.
+
+module Window = structure {
+
+  // ---- Wire constants (provisional; see header) --------------------------
+  pub let WINDOW_WIDTH             : u64 = 128
+  pub let WINDOW_HEIGHT            : u64 = 48
+  pub let SURFACE_FORMAT_ARGB32    : u64 = 1
+  pub let WINDOW_KIND_OPEN         : u64 = 1
+  pub let WINDOW_KIND_CLOSING      : u64 = 2
+  pub let WINDOW_OPEN_TIMEOUT_NS   : u64 = 1000000000   // 1s
+
+  // "PDXCWOPN" / "PDXCWREC" / "PDXCDTCH" read as 8 ASCII bytes in
+  // MSB-first hex-literal order, mkdir schema-tag convention.
+  pub let OPEN_REQ_TAG   : u64 = 0x50445843574F504E
+  pub let RECORD_TAG     : u64 = 0x5044584357524543
+  pub let DETACH_TAG     : u64 = 0x5044584344544348
+
+  // "svc.compositor" — 14 bytes, no NUL (svc_lookup takes an explicit
+  // length, not a NUL-terminated string).
+  pub let _window_svc_name : [u8; 14] = "svc.compositor"
+
+  // Bookkeeping globals consumed by render.pdx (indirectly, via
+  // close.pdx's poll) and close.pdx directly.
+  pub let mut _window_endpoint     : u64 = 0
+  pub let mut _window_surface_slot : u64 = 0
+  pub let mut _window_kind         : u64 = 0   // last known WindowRecord kind
+
+  // 48-byte PdxWindowOpenRequest: tag, width, height, x, y, format.
+  pub let mut _window_req_buf   : [u8; 48] = uninit @align(8)
+  // 32-byte PdxWindowRecord reply: tag, kind, surface_slot, reserved.
+  pub let mut _window_reply_buf : [u8; 32] = uninit @align(8)
+  // 8-byte DETACH message body (just the tag).
+  pub let mut _window_detach_buf : [u8; 8] = uninit @align(8)
+
+  // ==========================================================================
+  // svc_lookup(name_va, name_len) -> endpoint_or_errno
+  //
+  // Real syscall (SC+ 43). Arity 2, no r10 shuffle. Mirrors
+  // tools/user/mv/src/audit.pdx's own svc_lookup trampoline verbatim.
+  // ==========================================================================
+  pub let svc_lookup : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (name_va: u64, name_len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap},
+      justification: "pdxclock.M1-002 (#2) svc_lookup trampoline. Real syscall (sysno 43 = SYS_SVC_LOOKUP, design/user/syscall-table.md row 43). Arity 2 (name_va=rdi, name_len=rsi), no r10 shuffle. Return: KIND_IPC_ENDPOINT cap_slot >= 0 on success, negative errno on failure (-ESRCH expected today -- svc.compositor is not registered by any process in this workspace; see window.pdx header). @{cap} because success mints a cap into the caller's cap_table. Leaf; sysreg for SYSRET rcx/r11 clobber.",
+      block: {
+        mov rax, 43;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ipc_send(endpoint, hdr_va, payload_va, payload_len) -> 0_or_errno
+  //
+  // Real syscall (SC+ 42). Arity 4 -- SysV 4th arg (rcx) shuffles to
+  // syscall r10. hdr_va is always 0 here (pdxclock's wire has no
+  // separate header; every record is self-describing via its own
+  // leading tag field).
+  // ==========================================================================
+  pub let ipc_send : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (endpoint: u64, hdr_va: u64, payload_va: u64, payload_len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap},
+      justification: "pdxclock.M1-002 (#2) / M3-001 (#4) ipc_send trampoline. Real syscall (sysno 42 = SYS_IPC_SEND, design/user/syscall-table.md row 42). Arity 4 requires the SysV-rcx-to-syscall-r10 shuffle (rcx is clobbered by the SYSCALL instruction's own RIP save, so the 4th argument must move to r10 before the syscall fires). Return: 0 on success, negative errno on failure. @{cap} because ipc_send consumes the KIND_IPC_ENDPOINT identified by `endpoint`. Leaf; sysreg for SYSRET rcx/r11 clobber. Shared by both the M1-002 window-open request and the M3-001 DETACH send.",
+      block: {
+        mov r10, rcx;                          // SysV 4th arg -> syscall r10
+        mov rax, 42;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ipc_recv(endpoint, buf, cap_out, timeout_ns) -> bytes_or_errno
+  //
+  // Real syscall (SC+ 40). Arity 4, same rcx->r10 shuffle as
+  // ipc_send. cap_out is always 0 here (pdxclock's wire never expects
+  // an inbound capability transfer). timeout_ns == 0 means "poll,
+  // don't block" (used by close.pdx's per-tick CLOSING check);
+  // WINDOW_OPEN_TIMEOUT_NS (1s) is used for the initial handshake.
+  // ==========================================================================
+  pub let ipc_recv : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (endpoint: u64, buf: u64, cap_out: u64, timeout_ns: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap},
+      justification: "pdxclock.M1-002 (#2) / M3-001 (#4) ipc_recv trampoline. Real syscall (sysno 40 = SYS_IPC_RECV, design/user/syscall-table.md row 40). Arity 4, SysV-rcx-to-r10 shuffle as ipc_send. Return: bytes received (> 0) on a delivered message, 0 on a timed-out non-blocking poll (cap_clock convention shared with the R20b IPC surface), negative errno on failure. @{cap} because the recv consumes the KIND_IPC_ENDPOINT identified by `endpoint`. Leaf; sysreg for SYSRET rcx/r11 clobber. Shared by the M1-002 window-open reply wait and the M3-001 per-tick CLOSING poll (close.pdx passes timeout_ns=0 there for a non-blocking drain).",
+      block: {
+        mov r10, rcx;                          // SysV 4th arg -> syscall r10
+        mov rax, 40;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // window_open(x, y) -> 0_or_errno
+  //
+  // Looks up svc.compositor, sends a PdxWindowOpenRequest for a
+  // 128x48 ARGB32 window at (x, y), and waits (up to
+  // WINDOW_OPEN_TIMEOUT_NS) for the PdxWindowRecord reply. On success,
+  // publishes _window_endpoint / _window_surface_slot / _window_kind
+  // and returns 0. On any failure, returns the negative errno from
+  // whichever step failed; _window_endpoint is published as soon as
+  // svc_lookup succeeds (so a later ipc_send/ipc_recv failure still
+  // leaves an endpoint close.pdx COULD attempt a DETACH against,
+  // though _start's fail-closed contract means close.pdx is never
+  // reached on this path at v0.5.0).
+  // ==========================================================================
+  pub let window_open : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (x: u64, y: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap},
+      justification: "pdxclock.M1-002 (#2) window_open. 3-push prologue (rbx=x, r12=y, r13=endpoint) -- entry rsp%16==8 (SysV call from _start), 3 pushes -> 0, stable for every nested call below. Step 1: call svc_lookup(&_window_svc_name, 14); cmp rax,0; jl wnd_open_done (propagate -errno verbatim straight to the shared epilogue -- rax already holds it, and no register is clobbered between the failing cmp and the jump). Step 2: r13=rax (endpoint); publish to _window_endpoint immediately via lea+mov (post-lookup, pre any further call, so no clobber risk even on a later step's failure). Step 3: compose the 48-byte _window_req_buf via movabs OPEN_REQ_TAG + width(128)/height(48)/x(rbx)/y(r12)/format(1) stores at offsets 0/8/16/24/32/40. Step 4: call ipc_send(r13, 0, &_window_req_buf, 48); cmp rax,0; jne wnd_open_done (same passthrough). Step 5: call ipc_recv(r13, &_window_reply_buf, 0, WINDOW_OPEN_TIMEOUT_NS); cmp rax,0; jl wnd_open_done (same passthrough). Step 6: on success, copy reply_buf[8] (kind) -> _window_kind and reply_buf[16] (surface_slot) -> _window_surface_slot; xor rax,rax (return 0); falls through to wnd_open_done. 3-pop epilogue mirrors the prologue. No test rN,rN. No and rN,imm64. No 2-op imul. All immediates besides the two movabs tags fit imm32. Labels prefixed wnd_.",
+      block: {
+        push rbx;                              // rsp%16: 8 -> 0
+        push r12;                              // rsp%16: 0 -> 8
+        push r13;                              // rsp%16: 8 -> 0
+
+        mov rbx, rdi;                          // rbx = x
+        mov r12, rsi;                          // r12 = y
+
+        lea rdi, [rip + _window_svc_name];
+        mov rsi, 14;
+        call svc_lookup;
+        cmp rax, 0;
+        jl  wnd_open_done;
+
+        mov r13, rax;                          // r13 = endpoint
+        lea rax, [rip + _window_endpoint];
+        mov [rax], r13;
+
+        // ---- compose PdxWindowOpenRequest --------------------------
+        lea r8, [rip + _window_req_buf];
+        mov rax, OPEN_REQ_TAG;
+        mov [r8 + 0], rax;
+        mov rax, WINDOW_WIDTH;
+        mov [r8 + 8], rax;
+        mov rax, WINDOW_HEIGHT;
+        mov [r8 + 16], rax;
+        mov [r8 + 24], rbx;                    // x
+        mov [r8 + 32], r12;                    // y
+        mov rax, SURFACE_FORMAT_ARGB32;
+        mov [r8 + 40], rax;
+
+        mov rdi, r13;
+        xor rsi, rsi;
+        lea rdx, [rip + _window_req_buf];
+        mov rcx, 48;
+        call ipc_send;
+        cmp rax, 0;
+        jne wnd_open_done;
+
+        mov rdi, r13;
+        lea rsi, [rip + _window_reply_buf];
+        xor rdx, rdx;
+        mov rcx, WINDOW_OPEN_TIMEOUT_NS;
+        call ipc_recv;
+        cmp rax, 0;
+        jl  wnd_open_done;
+
+        lea r8, [rip + _window_reply_buf];
+        mov rax, [r8 + 8];                     // kind
+        lea r9, [rip + _window_kind];
+        mov [r9], rax;
+        mov rax, [r8 + 16];                    // surface_slot
+        lea r9, [rip + _window_surface_slot];
+        mov [r9], rax;
+
+        xor rax, rax;
+
+      wnd_open_done:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

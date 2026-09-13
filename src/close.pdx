@@ -1,0 +1,105 @@
+// src/close.pdx — pdxclock v0.5.0 (R102.M3-001, paideia-os/pdxclock#4)
+//
+// Close module: per-tick CLOSING poll + clean shutdown.
+//
+// `close_poll` is called once per render_run_tick cycle from
+// src/pdxclock.pdx's main loop (~1 Hz, per render.pdx's delta-based
+// cadence — see that file's header for why there is no dedicated
+// sleep syscall to hang this poll off of instead). It issues a
+// NON-BLOCKING `ipc_recv` (timeout_ns = 0) against the window's
+// endpoint; if a PdxWindowRecord with kind == WINDOW_KIND_CLOSING has
+// arrived, it sends a DETACH message back to the compositor (best-
+// effort — the return value is discarded, matching the silent-write
+// posture the rest of this tree uses for non-critical notifications)
+// and then calls `sys_exit(0)` directly. No message, a timed-out poll
+// (ipc_recv returns 0), or any error (negative errno) all fall
+// through to a plain return, leaving the render loop running.
+//
+// Cross-file symbol note
+// -----------------------
+// `_window_endpoint`, `_window_reply_buf`, and `_window_detach_buf`
+// are DATA symbols declared in src/window.pdx and referenced here via
+// `lea reg, [rip + symbol]` — an ordinary cross-file relocation, the
+// same mechanism tools/user/mv/src/entry.pdx uses to `call mv_reset`
+// (a CODE symbol) defined in a sibling file. `ipc_recv` / `ipc_send`
+// (also window.pdx) are called the same way.
+//
+// WINDOW_KIND_CLOSING and DETACH_TAG, by contrast, are re-declared
+// LOCALLY below rather than referenced by name from window.pdx: a
+// `pub let X : u64 = <literal>` scalar constant is folded into the
+// encoded instruction bytes at assemble time, and paideia-as builds
+// each file independently (`--emit elf64` per file, no cross-module
+// link resolution for compile-time values) — so a bare-name reference
+// to a constant declared in another file would not resolve. This is
+// the same duplicate-with-cross-reference convention
+// src/kernel/core/cap/kind_surface.pdx uses for its
+// KIND_SURFACE = 0x1B8 identity (re-declared from, and commented as
+// mirroring, src/user/compositor/surface_kind.pdx's canonical
+// declaration). The two literals below MUST stay byte-identical to
+// window.pdx's WINDOW_KIND_CLOSING / DETACH_TAG if either changes.
+//
+// paideia-as compliance: module basename PascalCase (`Close`); no
+// `test rN,rN`; no `and rN, imm64` on r8-r15; no 2-op `imul`; every
+// `cmp` immediate fits imm8 except the movabs DETACH_TAG. Labels
+// prefixed `cls_` (dodges the reserved `if`/`loop`; also avoids
+// colliding with window.pdx's `wnd_` prefix in the shared debug ring
+// even though paideia-as scopes labels per-function, not per-binary).
+
+module Close = structure {
+
+  // Mirrors src/window.pdx's WINDOW_KIND_CLOSING (see header note).
+  pub let WINDOW_KIND_CLOSING : u64 = 2
+
+  // Mirrors src/window.pdx's DETACH_TAG ("PDXCDTCH" wire tag).
+  pub let DETACH_TAG : u64 = 0x5044584344544348
+
+  // ==========================================================================
+  // close_poll() -> ()
+  //
+  // Never returns on the CLOSING path (ends in sys_exit); returns
+  // normally on every other path.
+  // ==========================================================================
+  pub let close_poll : () -> () !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap},
+      justification: "pdxclock.M3-001 (#4) close_poll. `sub rsp, 8` flips entry rsp%16 from 8 (SysV call-site convention) to 0 for the nested ipc_recv/ipc_send calls -- no registers need callee-save preservation because every value is reloaded from its .data/.bss home after each call rather than carried in a register across it. Step 1: lea+mov loads _window_endpoint's VALUE into rdi; lea rsi=&_window_reply_buf; xor rdx,rdx (no inbound cap expected); mov rcx,0 (non-blocking poll); call ipc_recv. cmp rax,0; jle cls_done (<=0 covers both the 0 = timed-out-poll case and any negative-errno failure -- neither is actionable here). Step 2: r8=&_window_reply_buf; rax=[r8+8] (kind field); cmp rax,2 (WINDOW_KIND_CLOSING); jne cls_done. Step 3: compose the 8-byte DETACH body at _window_detach_buf via movabs DETACH_TAG + mov [r8],rax. Step 4: reload _window_endpoint into rdi (call ipc_recv clobbered it), xor rsi,rsi, lea rdx=&_window_detach_buf, mov rcx,8, call ipc_send -- return value discarded (best-effort DETACH; the process is exiting either way). Step 5: xor rdi,rdi; mov rax,60; syscall -- sys_exit(0), never returns; a trailing `hlt` is dead-code safety net matching tools/user/mkdir's post-exit convention. cls_done: add rsp,8; ret. No test rN,rN. No and rN,imm64. No 2-op imul. Every cmp immediate (0, 2) fits imm8; the one movabs is DETACH_TAG. Labels prefixed cls_.",
+      block: {
+        sub rsp, 8;                            // rsp%16: 8 -> 0
+
+        lea rax, [rip + _window_endpoint];
+        mov rdi, [rax];                        // rdi = endpoint
+        lea rsi, [rip + _window_reply_buf];
+        xor rdx, rdx;                          // no inbound cap expected
+        mov rcx, 0;                            // non-blocking poll
+        call ipc_recv;
+        cmp rax, 0;
+        jle cls_done;                          // no message / error
+
+        lea r8, [rip + _window_reply_buf];
+        mov rax, [r8 + 8];                     // kind
+        cmp rax, 2;                            // WINDOW_KIND_CLOSING literal (paideia-as needs imm)
+        jne cls_done;
+
+        lea r8, [rip + _window_detach_buf];
+        mov rax, 0x5044584344544348;           // DETACH_TAG literal
+        mov [r8], rax;
+
+        lea rax, [rip + _window_endpoint];
+        mov rdi, [rax];                        // rdi = endpoint (reloaded)
+        xor rsi, rsi;
+        lea rdx, [rip + _window_detach_buf];
+        mov rcx, 8;
+        call ipc_send;                         // best-effort; rax discarded
+
+        xor rdi, rdi;                          // exit status 0
+        mov rax, 60;                           // SYS_EXIT
+        syscall;
+        hlt;                                   // unreachable
+
+      cls_done:
+        add rsp, 8;
+        ret
+      }
+    }
+}

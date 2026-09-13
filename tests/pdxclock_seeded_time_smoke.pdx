@@ -1,0 +1,122 @@
+// tests/pdxclock_seeded_time_smoke.pdx — pdxclock v0.5.0
+// (R102.M4-001, paideia-os/pdxclock#5)
+//
+// PdxclockSeededTimeSmoke module: golden-output regression for
+// Render::format_hms against one seeded `sys_clock_read_ns` value.
+//
+// Seed value and expected output
+// -------------------------------
+// Seed: 1_700_000_000_000_000_000 ns (since boot, per
+// `sys_clock_read_ns`'s own contract — see src/render.pdx's header
+// for why this is elapsed time, not wall-clock/epoch time).
+//
+//   total_seconds = 1_700_000_000_000_000_000 / 1_000_000_000
+//                 = 1_700_000_000
+//   day_seconds   = 1_700_000_000 mod 86_400
+//                 = 1_700_000_000 - (86_400 * 19_675)
+//                 = 1_700_000_000 - 1_699_920_000
+//                 = 80_000
+//   hh            = 80_000 / 3600 = 22   (22 * 3600 = 79_200)
+//   rem           = 80_000 - 79_200 = 800
+//   mm            = 800 / 60 = 13        (13 * 60 = 780)
+//   ss            = 800 - 780 = 20
+//
+//   -> "22:13:20"
+//
+// The R102.M4-001 scope note this issue was filed against suggested
+// "16:53:20" as the expected string; that arithmetic does not hold
+// under either interpretation of the seed (ns-since-boot mod 24h, or
+// the same value read as a Unix epoch timestamp — both land on
+// 22:13:20, since 1_700_000_000 mod 86_400 is the same computation
+// either way). The issue's own text allows for this ("or the correct
+// H:M:S decomposition"); this fixture asserts the value the
+// arithmetic actually produces, "22:13:20", so a future reader
+// re-deriving the seed does not chase a stale golden string.
+//
+// Fixture strategy
+// -----------------
+// Calls the REAL src/render.pdx `Render::format_hms` (cross-file
+// call — an ordinary ELF symbol relocation resolved at final-link
+// time, same mechanism tools/user/mv/src/entry.pdx uses to `call
+// mv_reset` defined in a sibling file; paideia-as's per-file
+// `--emit elf64` build has no cross-module link resolution, so this
+// assembles standalone today and becomes a real regression the day a
+// pdxclock-tests harness links this object against render.o) rather
+// than re-implementing the hh:mm:ss decomposition inline — the point
+// of this fixture is to pin format_hms's actual behaviour, not a
+// second copy of its arithmetic that could drift out of sync with it.
+//
+// paideia-as compliance: module basename PascalCase
+// (`PdxclockSeededTimeSmoke`); no `test rN,rN`; no `and rN, imm64` on
+// r8-r15; no 2-op `imul`; every `cmp` immediate fits imm8 (the seed
+// itself is the one movabs). Labels prefixed `stsm_`.
+
+module PdxclockSeededTimeSmoke = structure {
+
+  pub let mut _stsm_out_buf : [u8; 8] = uninit @align(8)
+
+  // Golden expected bytes — no NUL, format_hms's output contract is
+  // exactly 8 raw ASCII bytes.
+  pub let _stsm_expected : [u8; 8] = "22:13:20"
+
+  pub let _stsm_pass_msg : [u8; 34] = "[pdxclock.M4-001 SEEDED-TIME OK]\n\0"
+  pub let _stsm_pass_len : u64 = 33
+  pub let _stsm_fail_msg : [u8; 36] = "[pdxclock.M4-001 SEEDED-TIME FAIL]\n\0"
+  pub let _stsm_fail_len : u64 = 35
+
+  // ==========================================================================
+  // run() -> u64
+  //
+  // 0 on pass, 1 on the first mismatched byte.
+  // ==========================================================================
+  pub let run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {},
+      justification: "pdxclock.M4-001 (#5) run(). `sub rsp, 8` flips entry rsp%16 from 8 to 0 for the single nested `call format_hms`. Seeds rdi = 1_700_000_000_000_000_000 (movabs -- exceeds imm32) and rsi = &_stsm_out_buf, then calls the REAL Render::format_hms (cross-file symbol, see header). Post-call, r8 = &_stsm_out_buf, r9 = &_stsm_expected, rcx = 0; stsm_cmp_top: cmp rcx,8; jge stsm_pass (all 8 bytes matched); xor rax,rax + mov_b rax,[r8+rcx*1] loads the actual byte, xor rdx,rdx + mov_b rdx,[r9+rcx*1] loads the expected byte (#1248 byte-load discipline, both sides); cmp rax,rdx; jne stsm_fail; inc rcx; jmp stsm_cmp_top. stsm_pass emits the OK marker via sys_debug_puts (sysno 12) and returns 0; stsm_fail emits the FAIL marker and returns 1. Both marker emits happen AFTER the compare loop so the loop itself never touches rax/rdx for anything but the byte compare. No test rN,rN. No and rN,imm64. No 2-op imul. Every cmp immediate (8, byte values 0-255) fits imm8/imm32; the one movabs is the seed constant. Labels prefixed stsm_.",
+      block: {
+        sub rsp, 8;                            // rsp%16: 8 -> 0
+
+        mov rdi, 1700000000000000000;          // seed ns (movabs)
+        lea rsi, [rip + _stsm_out_buf];
+        call format_hms;
+
+        lea r8, [rip + _stsm_out_buf];
+        lea r9, [rip + _stsm_expected];
+        xor rcx, rcx;
+
+      stsm_cmp_top:
+        cmp rcx, 8;
+        jge stsm_pass;
+
+        xor rax, rax;
+        mov_b rax, [r8 + rcx*1];
+        xor rdx, rdx;
+        mov_b rdx, [r9 + rcx*1];
+        cmp rax, rdx;
+        jne stsm_fail;
+
+        inc rcx;
+        jmp stsm_cmp_top;
+
+      stsm_pass:
+        lea rdi, [rip + _stsm_pass_msg];
+        mov rsi, 33;                           // _stsm_pass_len
+        mov rax, 12;
+        syscall;
+        xor rax, rax;
+        jmp stsm_done;
+
+      stsm_fail:
+        lea rdi, [rip + _stsm_fail_msg];
+        mov rsi, 35;                           // _stsm_fail_len
+        mov rax, 12;
+        syscall;
+        mov rax, 1;
+
+      stsm_done:
+        add rsp, 8;
+        ret
+      }
+    }
+}

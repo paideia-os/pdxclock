@@ -1,0 +1,265 @@
+// src/render.pdx — pdxclock v0.5.0 (R102.M2-001, paideia-os/pdxclock#3)
+//
+// Render module: HH:MM:SS formatting + the 1 Hz render loop.
+//
+// Time source
+// -----------
+// `sys_clock_read_ns` (SC+ 66, design/user/syscall-table.md row 66) is
+// nullary and returns u64 nanoseconds SINCE BOOT (monotonic-non-
+// decreasing; body tail-calls `hpet_now_ns`) — not wall-clock/epoch
+// time. `format_hms` therefore renders the reading mod 24h, exactly
+// as an elapsed-time / uptime clock would: `(ns / 1e9) mod 86400`
+// decomposed into hh:mm:ss. tests/pdxclock_seeded_time_smoke.pdx
+// documents the one seeded value this repo checks (1_700_000_000_000
+// _000_000 ns -> "22:13:20") and the arithmetic behind it.
+//
+// Rendering substrate
+// --------------------
+// libpdx-gfx and libpdx-font (design/graphics/r102-user-plan.md §3.1 /
+// §3.2) are not yet landed as satellite repos, so there is no mapped-
+// framebuffer / glyph-store path to blit real pixels through. Per
+// R102.M2-001's own scope note ("WEAK 8-char stub emitting placeholder
+// text at pixel positions"), `blit_stub` emits the 8-char string over
+// the debug channel (SC+ 12 sys_debug_puts) instead of touching a
+// surface. The swap to a real `gfx_blit` + `libpdx-font` glyph walk is
+// a one-function-body change here; `render_run_tick`'s call site and
+// `format_hms`'s output contract (8 raw ASCII bytes, no NUL) do not
+// change.
+//
+// 1 Hz cadence
+// ------------
+// `render_run_tick` is deliberately delta-based rather than a fixed
+// sleep syscall — paideia-os has no `nanosleep`/`sys_clock_ticks`
+// syscall at HEAD (design/user/syscall-table.md has no such row); the
+// only primitive available is the same nullary `sys_clock_read_ns`
+// used for the render source. `_render_last_tick_ns` (0 = "never
+// ticked") gates a busy-wait: on the second and later calls,
+// render_run_tick spins re-reading the clock until >= 1_000_000_000 ns
+// have elapsed since the previous tick before rendering again. This
+// also bounds src/close.pdx's CLOSING-poll latency to ~1s, matching
+// R102.M4-002's "exits within one second (event_poll cadence)" smoke
+// contract even though libpdx-event itself is not linked here.
+//
+// paideia-as compliance: module basename PascalCase (`Render`); no
+// `test rN,rN` (every zero/threshold check is `cmp reg, imm`); no
+// `and rN, imm64` on r8-r15; no 2-op `imul` (format_hms uses `div` by
+// compile-time constants only — division, not multiplication, so the
+// tree's imul-avoidance convention does not apply, per the mkfs.pdxfs
+// / umount.pdxfs precedent); every `cmp` immediate fits imm32 (largest
+// is 1_000_000_000 for the ns-per-second divisor, well under
+// 0x7FFFFFFF). Byte stores via `mov_b [ptr+N], reg` (no sil/dil/bl
+// aliases). Labels prefixed `rnd_` to dodge reserved keywords (`loop`
+// is used as a divisor variable name nowhere — no collision risk, but
+// the prefix is applied uniformly per repo convention anyway).
+
+module Render = structure {
+
+  // Last successful tick's clock_read_ns() reading, in ns. 0 means
+  // "no tick yet" — the very first render_run_tick call renders
+  // immediately with no wait.
+  pub let mut _render_last_tick_ns : u64 = 0
+
+  // 8-byte "HH:MM:SS" scratch (no NUL — blit_stub knows its length).
+  pub let mut _render_out_buf : [u8; 8] = uninit @align(8)
+
+  // Debug-channel emission pieces (WEAK-stub blit substrate; see
+  // header). "[pdxclock] " is 11 bytes; the trailing "\n" is 1 byte.
+  pub let _render_prefix     : [u8; 11] = "[pdxclock] "
+  pub let _render_prefix_len : u64 = 11
+  pub let _render_nl         : [u8; 1]  = "\n"
+  pub let _render_nl_len     : u64 = 1
+
+  // ==========================================================================
+  // clock_read_ns() -> u64
+  //
+  // Real syscall (SC+ 66). Nullary — no argument registers to set up.
+  // ==========================================================================
+  pub let clock_read_ns : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {},
+      justification: "pdxclock.M2-001 (#3) clock_read_ns trampoline. Real nullary syscall (sysno 66 = SYS_CLOCK_READ_NS, design/user/syscall-table.md row 66). No argument registers -- the body tail-calls hpet_now_ns kernel-side and returns u64 ns-since-boot in rax unconditionally (no errno path per the table row's own note). Leaf; sysreg effect for the SYSRET rcx/r11 clobber. Declared KIND_CLOCK in caps.decl is documentary only -- this syscall is uncapped at HEAD (see caps.decl's substrate-posture note).",
+      block: {
+        mov rax, 66;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // format_hms(ns, out_ptr) -> ()
+  //
+  // Writes 8 raw ASCII bytes "HH:MM:SS" to [out_ptr .. out_ptr+8),
+  // decomposed from `ns` as (ns/1e9) mod 86400 -> hh/mm/ss. Pure
+  // computation: no syscall, no nested call, entirely register-based
+  // (div by the four compile-time constants 1_000_000_000 / 86400 /
+  // 3600 / 60 / 10), so no prologue/epilogue is needed regardless of
+  // entry rsp%16.
+  // ==========================================================================
+  pub let format_hms : (u64, u64) -> () !{mem} @{} =
+    fn (ns: u64, out_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "pdxclock.M2-001 (#3) format_hms: rdi=ns, rsi=out_ptr. Four sequential xor rdx,rdx + div-by-constant steps peel off total_seconds (rax = ns/1_000_000_000), day_seconds (rdx = total_seconds mod 86400, stashed in r8), hh (rax = day_seconds/3600 -> r9, rdx=rem1 -> r10), and mm/ss (rax = rem1/60 -> r10 reused as mm, rdx = ss -> r11). Each of hh/mm/ss is then split into two decimal digits via a final div-by-10 (rax=tens, rdx=ones), ASCII-shifted by +0x30, and stored via mov_b [rsi+N], reg -- six mov_b stores plus two literal ':' (0x3A) stores at offsets 2 and 5 cover the full 8-byte \"HH:MM:SS\" output. All four div-by-constant steps are DIVISION by compile-time literals (1_000_000_000, 86400, 3600, 60, 10), not multiplication, so this tree's imul-avoidance convention (which targets constant MULTIPLIES) does not apply -- same posture as mkfs.pdxfs/format_record.pdx's format_record_write_u64_dec. No test rN,rN. No and rN,imm64. No 2-op imul. Every cmp/mov immediate (1_000_000_000 max) fits imm32. Pure leaf: rdi/rsi are read-only inputs, r8-r11/rax/rdx/rcx are scratch, no callee-save obligation, no nested call, no prologue.",
+      block: {
+        mov rax, rdi;
+        xor rdx, rdx;
+        mov rcx, 1000000000;
+        div rcx;                              // rax = total_seconds
+
+        xor rdx, rdx;
+        mov rcx, 86400;
+        div rcx;                              // rdx = day_seconds
+        mov r8, rdx;
+
+        mov rax, r8;
+        xor rdx, rdx;
+        mov rcx, 3600;
+        div rcx;                              // rax = hh, rdx = rem1
+        mov r9, rax;                          // r9 = hh
+        mov r10, rdx;                         // r10 = rem1
+
+        mov rax, r10;
+        xor rdx, rdx;
+        mov rcx, 60;
+        div rcx;                              // rax = mm, rdx = ss
+        mov r10, rax;                         // r10 = mm
+        mov r11, rdx;                         // r11 = ss
+
+        // ---- hh -> out[0..2), ':' -> out[2] ------------------------
+        mov rax, r9;
+        xor rdx, rdx;
+        mov rcx, 10;
+        div rcx;
+        add rax, 0x30;
+        mov_b [rsi + 0], rax;
+        add rdx, 0x30;
+        mov_b [rsi + 1], rdx;
+        mov rax, 0x3A;                        // ':'
+        mov_b [rsi + 2], rax;
+
+        // ---- mm -> out[3..5), ':' -> out[5] ------------------------
+        mov rax, r10;
+        xor rdx, rdx;
+        mov rcx, 10;
+        div rcx;
+        add rax, 0x30;
+        mov_b [rsi + 3], rax;
+        add rdx, 0x30;
+        mov_b [rsi + 4], rdx;
+        mov rax, 0x3A;                        // ':'
+        mov_b [rsi + 5], rax;
+
+        // ---- ss -> out[6..8) -----------------------------------------
+        mov rax, r11;
+        xor rdx, rdx;
+        mov rcx, 10;
+        div rcx;
+        add rax, 0x30;
+        mov_b [rsi + 6], rax;
+        add rdx, 0x30;
+        mov_b [rsi + 7], rdx;
+
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // blit_stub(buf_ptr, len) -> ()
+  //
+  // WEAK-stub renderer (see header). Emits "[pdxclock] " + the 8-byte
+  // buffer + "\n" over the debug channel via three sys_debug_puts
+  // calls (SC+ 12), the same HEAD/body/TAIL composition idiom
+  // tools/user/mkdir/src/mkdir.pdx's --json emit uses. buf_ptr/len are
+  // passed through rather than hard-coded to `_render_out_buf` so a
+  // future real blit can reuse this signature unchanged.
+  // ==========================================================================
+  pub let blit_stub : (u64, u64) -> () !{mem, sysreg} @{} =
+    fn (buf_ptr: u64, len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {},
+      justification: "pdxclock.M2-001 (#3) blit_stub: three sys_debug_puts (sysno 12) calls emit the fixed 11-byte '[pdxclock] ' prefix, then the caller-supplied buf_ptr/len bytes verbatim (rdi/rsi already hold them from the SysV entry, so the body call site needs no register shuffle), then a 1-byte '\\n'. Each syscall's return value is discarded -- best-effort debug-channel emission, same posture as libpdx-argv's VersionBackend::emit_default silent-write policy. 2-push prologue (rbx=buf_ptr, r12=len) preserves both across the first sys_debug_puts call; entry rsp%16==8, 2 pushes -> rsp%16==8+... two pushes flip 8->0->8, landing back at 8, so a third `sub rsp,8` pad brings it to 0 for each syscall site (SYSCALL does not itself require 16-byte stack alignment on this kernel's convention, matching every other leaf-with-syscall in this tree, but the pad is kept for parity with the nested-call-capable shape a future real blit needs). No test rN,rN. No and rN,imm64. All immediates (11, 1) fit imm8.",
+      block: {
+        push rbx;                             // rsp%16: 8 -> 0
+        push r12;                             // rsp%16: 0 -> 8
+        sub rsp, 8;                           // rsp%16: 8 -> 0
+
+        mov rbx, rdi;                         // rbx = buf_ptr
+        mov r12, rsi;                         // r12 = len
+
+        lea rdi, [rip + _render_prefix];
+        mov rsi, 11;                          // _render_prefix_len
+        mov rax, 12;
+        syscall;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rax, 12;
+        syscall;
+
+        lea rdi, [rip + _render_nl];
+        mov rsi, 1;                           // _render_nl_len
+        mov rax, 12;
+        syscall;
+
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // render_run_tick() -> ()
+  //
+  // One cycle of the 1 Hz loop: on the first call, render immediately;
+  // on every later call, busy-wait (re-reading clock_read_ns) until
+  // >= 1s has elapsed since the previous tick, THEN render. Updates
+  // _render_last_tick_ns to the post-wait reading before returning, so
+  // drift does not accumulate across calls beyond one clock_read_ns
+  // granularity.
+  // ==========================================================================
+  pub let render_run_tick : () -> () !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {},
+      justification: "pdxclock.M2-001 (#3) render_run_tick. 1-push prologue (rbx unused across calls here -- kept for parity; r12 holds _render_last_tick_ns's cached value, r13 holds the just-read `now`). rsp%16 entry 8 -> push rbx (0) -> push r12 (8) -> push r13 (0), stable 0 for every nested call (clock_read_ns / format_hms / blit_stub). rnd_wait_top: call clock_read_ns -> r13=now. cmp r12,0; je rnd_render (first tick: r12==0 sentinel skips the wait). Otherwise compute elapsed = r13 - r12 via `mov rax,r13; sub rax,r12`; cmp rax,1000000000; jl rnd_wait_top (busy-wait: re-read the clock and retry). rnd_render: call format_hms(r13, &_render_out_buf); call blit_stub(&_render_out_buf, 8); store r13 into _render_last_tick_ns; pop r13/r12/rbx; ret. No test rN,rN (elapsed check is cmp rax,imm). All immediates fit imm32 (1_000_000_000 max, 8 min). Labels prefixed rnd_.",
+      block: {
+        push rbx;                             // rsp%16: 8 -> 0 (parity pad)
+        push r12;                             // rsp%16: 0 -> 8
+        push r13;                             // rsp%16: 8 -> 0
+
+        lea rax, [rip + _render_last_tick_ns];
+        mov r12, [rax];                       // r12 = last tick (0 = never)
+
+      rnd_wait_top:
+        call clock_read_ns;
+        mov r13, rax;                         // r13 = now
+
+        cmp r12, 0;
+        je  rnd_render;                       // first tick: no wait
+
+        mov rax, r13;
+        sub rax, r12;                         // rax = elapsed ns
+        cmp rax, 1000000000;
+        jl  rnd_wait_top;
+
+      rnd_render:
+        mov rdi, r13;
+        lea rsi, [rip + _render_out_buf];
+        call format_hms;
+
+        lea rdi, [rip + _render_out_buf];
+        mov rsi, 8;
+        call blit_stub;
+
+        lea rax, [rip + _render_last_tick_ns];
+        mov [rax], r13;
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

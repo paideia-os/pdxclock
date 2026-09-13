@@ -1,0 +1,65 @@
+# pdxclock — caps.decl
+#
+# Wave: R102.M1-001 / M1-002 (paideia-os/pdxclock#1, #2)
+# Doc:  design/graphics/r102-user-plan.md §2.7 (purpose) / §3.7 + §4.7
+#       (per-milestone scope) in the paideia-os monorepo.
+#
+# pdxclock is the deliberate smallest-useful-window app: it opens a
+# 128x48 window, renders HH:MM:SS once a second, and exits cleanly on
+# a WM-sent close. The four caps below are the full surface it needs.
+#
+# requires:
+#   KIND_USER          -- process identity (shell exec-time reconciliation
+#                          per invariant I6; every ring-3 tool declares it).
+#   KIND_IPC_ENDPOINT   -- svc_lookup("svc.compositor") (SC+ 43) + ipc_send
+#                          (SC+ 42) / ipc_recv (SC+ 40) against the returned
+#                          endpoint. Carries the window-open request/reply
+#                          handshake (src/window.pdx) and the CLOSING
+#                          WindowRecord poll + DETACH send (src/close.pdx).
+#   KIND_SURFACE        -- the 128x48 ARGB32 window surface, kind 0x1B8 per
+#                          src/kernel/core/cap/kind_surface.pdx (R113.M1-001,
+#                          landed kernel-side). Minted server-side by
+#                          svc-compositor in reply to the window-open
+#                          request; pdxclock holds the returned cap slot
+#                          for the lifetime of the window and releases it
+#                          (DETACH) on WindowRecord CLOSING.
+#   KIND_CLOCK          -- documentary. `sys_clock_read_ns` (SC+ 66,
+#                          design/user/syscall-table.md row 66) is today a
+#                          nullary, uncapped syscall -- "no arguments, no
+#                          user pointer, no errno path" per its own table
+#                          row -- so this declaration gates nothing at
+#                          HEAD. It is declared per R102.M1-002's literal
+#                          scope ("caps.decl (KIND_SURFACE, libpdx-event
+#                          chan, monotonic clock syscall)") so a future
+#                          cap-gated clock source is a caps.decl no-op
+#                          swap rather than a new grant.
+#
+# Missing caps in the received set -> exit 4 (cap denied, I4). Extra
+# caps in the received set -> refused shell-side at exec (I6); pdxclock
+# never observes them.
+#
+# -----------------------------------------------------------------------
+# Substrate posture (2026-09-13, v0.5.0 landing)
+# -----------------------------------------------------------------------
+#
+# svc-compositor, svc-wm, libpdx-gfx, libpdx-font, and libpdx-event are
+# all still-unlanded satellite repos at this writing (none resolve at
+# this workspace HEAD; see design/graphics/r102-user-plan.md §3.4/§3.1/
+# §3.2/§3.3). pdxclock's window-open handshake (src/window.pdx) and
+# close handling (src/close.pdx) therefore speak a PROVISIONAL,
+# pdxclock-local wire (PdxWindowOpenRequest / PdxWindowRecord tags
+# defined in src/window.pdx) rather than a frozen cross-repo schema --
+# `svc_lookup("svc.compositor")` fails with -ESRCH until svc-compositor
+# registers, exactly as documented at each call site. Render::blit_stub
+# emits its 8-char output over the debug channel (SC+ 12) rather than a
+# real pixel blit, since no libpdx-gfx/libpdx-font mapped-framebuffer
+# path exists yet. Every one of these is a one-function swap when the
+# corresponding satellite lands; see the per-file headers for the exact
+# swap site.
+requires:
+  - KIND_USER
+  - KIND_IPC_ENDPOINT
+  - KIND_SURFACE
+  - KIND_CLOCK
+
+declares_output_schemas: (none)
