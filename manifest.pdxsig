@@ -1,6 +1,6 @@
 # pdxclock — manifest.pdxsig
 #
-# Dual-signed package manifest source-form for `pdxclock` v0.5.0.
+# Dual-signed package manifest source-form for `pdxclock` v1.0.0-src.
 #
 # Wave:  R102 (design/graphics/r102-user-plan.md, paideia-os monorepo)
 # Doc:   design/tooling/plan.md §D4 + §6.2-§6.4 for the two-key
@@ -16,22 +16,25 @@
 # carries the literal `PENDING`, and content hashes use interim
 # sha2-256 rather than the eventual on-wire sha3-256.
 #
-# This is a pre-1.0 (v0.5.0) landing — R102.M5-001 ("signed 1.0.0
-# release", paideia-os/pdxclock's own M5 issue, not yet filed in this
-# batch) is where a real signed manifest first ships. This file exists
-# now, at v0.5.0, per R102.M1-001's own scope note naming
-# "manifest.pdxsig source-form" as part of the repo scaffold.
+# R102.M5-001 ("signed 1.0.0 release", paideia-os/pdxclock#7) is THIS
+# release: all five R102 milestones (M1..M5) are now landed in source
+# form, but the dual ML-DSA-65 signature blocks below remain PENDING
+# until paideia-as v0.33 crypto lands — `pkg install --strict` refuses
+# this package until a release runner replaces both PENDING blocks in
+# place. Tag `v1.0.0-src` (not a bare `v1.0.0`) makes that
+# unsigned-source-form status visible at the tag itself rather than
+# implying a fully-signed 1.0.0 exists.
 
 # ---------------------------------------------------------------
 # §1 Package identity
 # ---------------------------------------------------------------
 package:
   name:              pdxclock
-  version:           0.5.0
-  wave:              R102 (M1-001 .. M4-001)
+  version:           1.0.0
+  wave:              R102 (M1-001 .. M5-001)
   category:          G  # Graphical userland (r102-user-plan.md app catalogue)
   release_date:      2026-09-13
-  git_tag:           v0.5.0
+  git_tag:           v1.0.0-src
   git_repo:          github.com/paideia-os/pdxclock
   license:           MIT
   paideia_as_target: v0.21          # min toolchain per tools/build.sh's own floor
@@ -47,7 +50,7 @@ caps_decl:
 # ---------------------------------------------------------------
 # §3 Dependency manifest reference
 # ---------------------------------------------------------------
-# No deps.list at v0.5.0 -- pdxclock links no shared library yet.
+# No deps.list at v1.0.0-src -- pdxclock links no shared library yet.
 # svc_lookup/ipc_send/ipc_recv are inline syscall trampolines
 # (src/window.pdx), matching tools/user/mv's own posture before its
 # libpdx-argv adoption.
@@ -77,6 +80,8 @@ content_hashes:
     - path: src/pdxclock.pdx
       hash: TBD-RECOMPUTED-AT-SIGN
     - path: tests/pdxclock_seeded_time_smoke.pdx
+      hash: TBD-RECOMPUTED-AT-SIGN
+    - path: tests/pdxclock_wm_quit_smoke.pdx
       hash: TBD-RECOMPUTED-AT-SIGN
 
 # ---------------------------------------------------------------

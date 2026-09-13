@@ -1,0 +1,190 @@
+// tests/pdxclock_wm_quit_smoke.pdx — pdxclock v0.6.0
+// (R102.M4-002, paideia-os/pdxclock#6)
+//
+// PdxclockWmQuitSmoke module: feeds a canned WM_QUIT-shaped
+// PdxWindowRecord (kind == WINDOW_KIND_CLOSING) through a MOCKED
+// ipc_recv/ipc_send pair into the REAL Close::close_poll, and asserts
+// that close_poll takes its sys_exit(0) path.
+//
+// =============================================================================
+// WHY "close_poll", NOT "cls_run_tick"
+// =============================================================================
+//
+// The issue text names the function under test "Close::cls_run_tick".
+// No such symbol exists anywhere in this repo: src/close.pdx's only
+// public entry point is `close_poll` (module Close), called once per
+// render_run_tick cycle from src/pdxclock.pdx's main loop (see that
+// file's own comment: "close_poll itself exits the process on
+// WindowRecord CLOSING"). `cls_` IS this file's real label prefix
+// (close.pdx's own compliance note: "Labels prefixed cls_"), so
+// "cls_run_tick" reads as a conflation of that label prefix with the
+// per-tick CALLER (render_run_tick / the pdxclock main loop) rather
+// than a distinct function this repo ever declared. This fixture
+// therefore targets `close_poll`, the only function close.pdx exports
+// that could possibly be the issue's intended target — the same
+// "assert the arithmetic that actually exists" posture
+// tests/pdxclock_seeded_time_smoke.pdx already documents for its own
+// issue-text/reality mismatch (see that file's header).
+//
+// =============================================================================
+// WHY THE PROCESS'S OWN EXIT CODE IS THE ASSERTION, NOT A "MOCKED
+// SYSCALL COUNTER"
+// =============================================================================
+//
+// close_poll's CLOSING path ends in a BARE `mov rax, 60; syscall`
+// (src/close.pdx) — a raw SYSCALL instruction, not a call through a
+// named symbol. paideia-as's per-file assembly model (no cross-module
+// link resolution at `--emit elf64` time; see this repo's tools/
+// build.sh header) gives every OTHER external reference in this repo
+// a shadowable seam (a `call <symbol>` this test file can redefine
+// locally, e.g. ipc_recv/ipc_send below) — but a hardware SYSCALL
+// trap has no symbol to shadow. Refactoring close_poll to route
+// sys_exit through an indirect, mockable call is a real option for a
+// FUTURE issue, but out of scope here: this cohort's issue does not
+// ask for a close.pdx behavior change, and v0.5.0's close_poll is
+// otherwise frozen. Given that constraint, this fixture's `run()`
+// really does invoke the real `close_poll`, which really does reach
+// `syscall` with rax=60/rdi=0 on the canned CLOSING record below —
+// and that syscall really does terminate the process. The assertion
+// this smoke test makes is therefore EXTERNALLY OBSERVABLE rather
+// than internally counted: a harness that execs this fixture's linked
+// binary and checks its own exit status sees exactly 0 if and only if
+// close_poll took the CLOSING/sys_exit(0) path on the canned record
+// below — any OTHER close_poll behavior (an uncaught fall-through to
+// `ret`, a non-zero exit, a crash) is distinguishable by the harness
+// as a non-zero or abnormal exit status. This is a weaker in-process
+// guarantee than a real instrumented "syscall counter" would give,
+// but it is the strongest assertion available without either
+// modifying close.pdx's frozen body or introducing a syscall-
+// interception layer this toolchain does not have at v0.6.0.
+//
+// =============================================================================
+// MOCKED SEAMS
+// =============================================================================
+//
+// close_poll's external references, mocked here so a FUTURE
+// pdxclock-tests harness can link close.o + this file's .o WITHOUT
+// window.o (the same "exclude the real dependency, supply canned
+// data + code instead" pattern this repo's other smoke fixture uses
+// for format_hms, except here the mocks replace window.pdx's SYSCALL
+// TRAMPOLINES and DATA GLOBALS rather than leaving them real):
+//
+//   _window_endpoint      — re-declared here (arbitrary nonzero
+//                           value, 7; close_poll only round-trips it
+//                           through the mocked ipc_recv/ipc_send
+//                           below, never inspects it itself).
+//   _window_reply_buf     — re-declared here (32 bytes, matching
+//                           window.pdx's own declared size even
+//                           though this file's mock ipc_recv only
+//                           populates the first 24 of them — "returns
+//                           24B record" per the issue text —
+//                           close_poll itself only ever reads byte
+//                           offset +8).
+//   _window_detach_buf    — re-declared here (8 bytes); close_poll
+//                           writes DETACH_TAG into it and passes it
+//                           to the mocked ipc_send below.
+//   ipc_recv(endpoint,buf,cap_out,timeout_ns) — MOCK: ignores every
+//                           argument except `buf`; writes the canned
+//                           24-byte WM_QUIT-shaped record (RECORD_TAG
+//                           at +0, WINDOW_KIND_CLOSING (2) at +8, a
+//                           dummy surface_slot (0) at +16) into
+//                           [buf], returns 24.
+//   ipc_send(endpoint,hdr_va,payload_va,payload_len) — MOCK: ignores
+//                           every argument, returns 0 (success) —
+//                           close_poll discards this return value
+//                           anyway (best-effort DETACH).
+//
+// paideia-as compliance: module basename PascalCase
+// (`PdxclockWmQuitSmoke`); no `test rN,rN`; no `and rN, imm64` on
+// r8-r15; no 2-op `imul`; every `cmp` immediate fits imm8; the two
+// wire-tag loads use movabs. No internal labels needed at this wave
+// (every function here is straight-line, no branches).
+
+module PdxclockWmQuitSmoke = structure {
+
+  pub let WINDOW_KIND_CLOSING : u64 = 2                    // mirrors window.pdx / close.pdx
+  pub let RECORD_TAG          : u64 = 0x5044584357524543   // "PDXCWREC", mirrors window.pdx
+
+  // ---- Mocked window.pdx globals (see file header MOCKED SEAMS) ----------
+  pub let mut _window_endpoint   : u64      = 7   // arbitrary nonzero id
+  pub let mut _window_reply_buf  : [u8; 32] = uninit @align(8)
+  pub let mut _window_detach_buf : [u8; 8]  = uninit @align(8)
+
+  pub let _wqs_pass_msg : [u8; 33] = "[pdxclock.M4-002 WM-QUIT ARMED]\n\0"
+  pub let _wqs_pass_len : u64 = 32
+
+  // ==========================================================================
+  // ipc_recv(endpoint, buf, cap_out, timeout_ns) -> u64   -- MOCK
+  //
+  // Ignores every argument except `buf`. Writes a canned 24-byte
+  // WM_QUIT-shaped PdxWindowRecord (RECORD_TAG / WINDOW_KIND_CLOSING /
+  // surface_slot=0) into [buf] and returns 24 — the ">0, real
+  // message" branch of close_poll's `cmp rax,0; jle cls_done` gate.
+  // ==========================================================================
+  pub let ipc_recv : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (endpoint: u64, buf: u64, cap_out: u64, timeout_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxclock.M4-002 (#6): mocked ipc_recv. Ignores rdi/rdx/rcx (endpoint/cap_out/timeout_ns); rsi=buf is the only argument used. Writes RECORD_TAG (movabs) to [buf+0], WINDOW_KIND_CLOSING (2) to [buf+8], 0 (dummy surface_slot) to [buf+16] -- a 24-byte canned record, per the issue's '24B record' spec, even though _window_reply_buf itself is declared 32 bytes to match window.pdx's real shape. Returns 24 in rax. Leaf; no callee-save touched. No test rN,rN. No and rN,imm64. No 2-op imul.",
+      block: {
+        mov rax, RECORD_TAG;
+        mov [rsi + 0], rax;
+        mov rax, 2;                    // WINDOW_KIND_CLOSING
+        mov [rsi + 8], rax;
+        xor rax, rax;
+        mov [rsi + 16], rax;           // dummy surface_slot
+        mov rax, 24;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ipc_send(endpoint, hdr_va, payload_va, payload_len) -> u64   -- MOCK
+  //
+  // Ignores every argument; always returns 0 (success). close_poll's
+  // DETACH send discards this return value regardless.
+  // ==========================================================================
+  pub let ipc_send : (u64, u64, u64, u64) -> u64 !{} @{} =
+    fn (endpoint: u64, hdr_va: u64, payload_va: u64, payload_len: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "pdxclock.M4-002 (#6): mocked ipc_send. Ignores every argument, returns 0 unconditionally. Leaf, no memory, no stack.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // run() -> u64
+  //
+  // Calls the REAL Close::close_poll against the mocked seams above.
+  // See file header: on the expected CLOSING path this call NEVER
+  // RETURNS — close_poll reaches its real `sys_exit(0)` and the
+  // process terminates with status 0, which IS this fixture's
+  // assertion (see WHY THE PROCESS'S OWN EXIT CODE IS THE ASSERTION
+  // above). The pass-message emit below it therefore documents intent
+  // for a reader rather than ever executing; it is unreachable on the
+  // expected path and exists only so a future close_poll regression
+  // that fails to reach sys_exit (an incorrect `ret` instead) leaves
+  // an observable trace (the PASS marker per this file's own emit)
+  // rather than silently doing nothing.
+  // ==========================================================================
+  pub let run : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "pdxclock.M4-002 (#6): run() entry point. `sub rsp, 8` flips entry rsp%16 from 8 to 0 for the single nested `call close_poll`. No argument marshalling needed -- close_poll takes no arguments, and _window_endpoint is already seeded to 7 by this module's own .data initializer (the mocked ipc_recv/ipc_send below don't inspect it anyway). On the expected path close_poll reaches its own real sys_exit(0) syscall and this function never returns (see file header); the sys_debug_puts pass-marker emit after the call is unreachable on that path and exists purely as a documented fallback trace for a future close_poll regression that returns instead of exiting. No test rN,rN. No and rN,imm64. No 2-op imul.",
+      block: {
+        sub rsp, 8;                    // rsp%16: 8 -> 0
+        call close_poll;
+
+        // Unreachable on the expected CLOSING/sys_exit(0) path --
+        // see file header and this function's justification.
+        lea rdi, [rip + _wqs_pass_msg];
+        mov rsi, 32;                   // _wqs_pass_len
+        mov rax, 12;
+        syscall;
+        add rsp, 8;
+        xor rax, rax;
+        ret
+      }
+    }
+}

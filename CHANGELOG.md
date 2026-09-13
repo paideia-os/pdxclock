@@ -3,6 +3,37 @@
 Semver-tagged release history. Every entry corresponds to a git tag on
 this repository.
 
+## 1.0.0-src — 2026-09-13 — M4-002 + M5-001 (Closes #6. Closes #7.)
+
+Closes out the R102 plan's five milestones. This is a SOURCE-FORM
+1.0.0 release: `manifest.pdxsig`'s dual ML-DSA-65 signature blocks
+remain `PENDING` — the ml_dsa_65_sign intrinsic, the svc.signing-bot
+broker, and the pkgs.paideia-os host all land at paideia-as v0.33
+("crypto"), still ahead of this repo's HEAD (see manifest.pdxsig's own
+substrate-posture note). `pkg install --strict` refuses this package
+until a release runner replaces both PENDING blocks — same posture
+every other satellite in this org ships pre-v0.33.
+
+- **#6 (M4-002 close-on-WM-quit smoke)** —
+  `tests/pdxclock_wm_quit_smoke.pdx` (`PdxclockWmQuitSmoke::run`)
+  feeds a canned 24-byte WM_QUIT-shaped `PdxWindowRecord`
+  (`kind == WINDOW_KIND_CLOSING`) through a mocked `ipc_recv`/
+  `ipc_send` pair into the real `Close::close_poll`. `close_poll`'s
+  own `sys_exit(0)` is a bare SYSCALL instruction, not a callable
+  symbol, so it cannot be intercepted by an in-process mock counter
+  at this toolchain's current (pre-v0.33) capability; the fixture's
+  assertion is therefore the process's own externally-observable exit
+  status (0 on the expected CLOSING/sys_exit path) rather than an
+  in-process counter — see the file's own header for the full
+  rationale, including why the fixture targets `close_poll` rather
+  than the issue text's `cls_run_tick` (no such symbol exists in this
+  repo; `cls_` is close.pdx's label prefix, not a function name).
+- **#7 (M5-001 signed 1.0.0 release)** — `manifest.pdxsig` bumped to
+  package version 1.0.0 / git tag `v1.0.0-src`, content-hash entries
+  extended to cover `tests/pdxclock_wm_quit_smoke.pdx`, both signature
+  blocks left `PENDING` per the substrate-gate note above. README
+  Status section updated to reflect all five R102 milestones landed.
+
 ## 0.5.0 — 2026-09-13 — M1..M4 landing (Closes #1. Closes #2. Closes #3. Closes #4. Closes #5.)
 
 First code landing. Lands R102.M1-001 through M4-001 in one batch per
