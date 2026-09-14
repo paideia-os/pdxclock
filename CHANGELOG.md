@@ -3,6 +3,23 @@
 Semver-tagged release history. Every entry corresponds to a git tag on
 this repository.
 
+## 1.1.0 — 2026-09-13 — Track C release closer (Closes #10.)
+
+Docs/release-only bump on top of `v1.0.0-src`: no `src/` or `tests/`
+file changes. Part of Track C's v1.1 pass across 12 mature satellites
+in the paideia-os org (see the monorepo's MASTER_PLAN.md for org-wide
+milestone alignment).
+
+- **#10 (v1.1-C release closer)** — `manifest.pdxsig` re-stamped:
+  `package.version` 1.0.0 → 1.1.0, `git_tag` `v1.0.0-src` → `v1.1.0`
+  (bare, no `-src` suffix, per the naming convention this org's other
+  post-1.0 satellites now use). Both dual ML-DSA-65 signature blocks
+  (§6 author, §7 root) remain `PENDING` — real signing still needs
+  paideia-as v0.33's crypto intrinsics, the svc.signing-bot broker,
+  and the pkgs.paideia-os host (T-INFRA-001/002), none of which are
+  reachable yet. README's Status section updated to describe the
+  v1.1.0 release-closer scope.
+
 ## 1.0.0-src — 2026-09-13 — M4-002 + M5-001 (Closes #6. Closes #7.)
 
 Closes out the R102 plan's five milestones. This is a SOURCE-FORM
