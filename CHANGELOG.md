@@ -3,6 +3,28 @@
 Semver-tagged release history. Every entry corresponds to a git tag on
 this repository.
 
+## 1.2.0 — 2026-09-13 — v1.1-B semantic-pipe emission wire (Closes #9.)
+
+Lands on top of the `v1.1.0` Track C release closer (below) — bumped
+to 1.2.0 rather than 1.1.0 since `v1.1.0` is already tagged in this
+repo's history for the docs-only #10 close:
+
+- **#9 (v1.1-B semantic-pipe emission wire)** — `src/pipe_emit.pdx`
+  (`Module PipeEmit`): `pipe_emit_send(ns_since_boot)` marshals a
+  128-byte `ClockTickRecord@0.1` (version/op, hour/minute/second
+  decoded via the same div-by-constant decomposition `Render::format_
+  hms` uses, the raw pre-mod `ns_since_boot` reading, an `rdtsc`
+  timestamp) and emits it via `sys_semantic_send` (sysno 115).
+  `Render::render_run_tick` (`src/render.pdx`) now calls `pipe_emit_
+  send` once per rendered tick, right after updating `_render_last_
+  tick_ns` — return discarded, best-effort, matching `pdxpaint`/`cat`/
+  `cp`'s own emission posture. `manifest.pdxsig` bumped to package
+  version 1.2.0 / git tag `v1.2.0` (bare, no `-src` suffix, per the
+  naming convention #10's Track C closer established below),
+  `content_hashes` extended to cover `src/pipe_emit.pdx`, and
+  `declares_output_schemas` (both `caps.decl` and the manifest) now
+  listing `ClockTickRecord@0.1`.
+
 ## 1.1.0 — 2026-09-13 — Track C release closer (Closes #10.)
 
 Docs/release-only bump on top of `v1.0.0-src`: no `src/` or `tests/`

@@ -62,4 +62,9 @@ requires:
   - KIND_SURFACE
   - KIND_CLOCK
 
-declares_output_schemas: (none)
+# As of v1.1.0 (pdxclock#9, v1.1-B semantic-pipe emission wire),
+# pdxclock declares one semantic-pipe output schema: ClockTickRecord@0.1,
+# emitted via sys_semantic_send (sysno 115) once per render tick
+# (Render::render_run_tick -> PipeEmit::pipe_emit_send, src/pipe_emit.pdx).
+declares_output_schemas:
+  - ClockTickRecord@0.1 (schema=0x436C6B5469636B01, len=128, via=sys_semantic_send)

@@ -1,4 +1,5 @@
-// src/render.pdx — pdxclock v0.5.0 (R102.M2-001, paideia-os/pdxclock#3)
+// src/render.pdx — pdxclock v0.5.0 (R102.M2-001, paideia-os/pdxclock#3) +
+// pdxclock#9 (v1.1-B semantic-pipe emission wire).
 //
 // Render module: HH:MM:SS formatting + the 1 Hz render loop.
 //
@@ -25,6 +26,16 @@
 // a one-function-body change here; `render_run_tick`'s call site and
 // `format_hms`'s output contract (8 raw ASCII bytes, no NUL) do not
 // change.
+//
+// Semantic-pipe emission (pdxclock#9)
+// -------------------------------------
+// `render_run_tick` now also calls `PipeEmit::pipe_emit_send` (src/
+// pipe_emit.pdx) once per rendered tick, right after the tick's own
+// `_render_last_tick_ns` update: a best-effort 128-byte
+// `ClockTickRecord@0.1` (hour/minute/second + the raw ns_since_boot
+// reading) is emitted over `sys_semantic_send` (sysno 115) for every
+// downstream semantic-pipe consumer. The return value is discarded,
+// matching every other pipe_emit call site in this tree.
 //
 // 1 Hz cadence
 // ------------
@@ -223,7 +234,7 @@ module Render = structure {
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {},
-      justification: "pdxclock.M2-001 (#3) render_run_tick. 1-push prologue (rbx unused across calls here -- kept for parity; r12 holds _render_last_tick_ns's cached value, r13 holds the just-read `now`). rsp%16 entry 8 -> push rbx (0) -> push r12 (8) -> push r13 (0), stable 0 for every nested call (clock_read_ns / format_hms / blit_stub). rnd_wait_top: call clock_read_ns -> r13=now. cmp r12,0; je rnd_render (first tick: r12==0 sentinel skips the wait). Otherwise compute elapsed = r13 - r12 via `mov rax,r13; sub rax,r12`; cmp rax,1000000000; jl rnd_wait_top (busy-wait: re-read the clock and retry). rnd_render: call format_hms(r13, &_render_out_buf); call blit_stub(&_render_out_buf, 8); store r13 into _render_last_tick_ns; pop r13/r12/rbx; ret. No test rN,rN (elapsed check is cmp rax,imm). All immediates fit imm32 (1_000_000_000 max, 8 min). Labels prefixed rnd_.",
+      justification: "pdxclock.M2-001 (#3) render_run_tick, extended by pdxclock#9 (semantic-pipe emission). 1-push prologue (rbx unused across calls here -- kept for parity; r12 holds _render_last_tick_ns's cached value, r13 holds the just-read `now`). rsp%16 entry 8 -> push rbx (0) -> push r12 (8) -> push r13 (0), stable 0 for every nested call (clock_read_ns / format_hms / blit_stub / pipe_emit_send). rnd_wait_top: call clock_read_ns -> r13=now. cmp r12,0; je rnd_render (first tick: r12==0 sentinel skips the wait). Otherwise compute elapsed = r13 - r12 via `mov rax,r13; sub rax,r12`; cmp rax,1000000000; jl rnd_wait_top (busy-wait: re-read the clock and retry). rnd_render: call format_hms(r13, &_render_out_buf); call blit_stub(&_render_out_buf, 8); store r13 into _render_last_tick_ns; call pipe_emit_send(r13) (pdxclock#9 -- emits one ClockTickRecord@0.1 for this tick's `now` reading; PipeEmit::pipe_emit_send itself preserves r12/r13 via its own three-push callee-save bracket, so both survive this call untouched even though r12 is no longer read past this point and r13 is not read again either, since the store already happened); pop r13/r12/rbx; ret. No test rN,rN (elapsed check is cmp rax,imm). All immediates fit imm32 (1_000_000_000 max, 8 min). Labels prefixed rnd_.",
       block: {
         push rbx;                             // rsp%16: 8 -> 0 (parity pad)
         push r12;                             // rsp%16: 0 -> 8
@@ -255,6 +266,9 @@ module Render = structure {
 
         lea rax, [rip + _render_last_tick_ns];
         mov [rax], r13;
+
+        mov rdi, r13;
+        call pipe_emit_send;          // pdxclock#9: emit ClockTickRecord@0.1
 
         pop r13;
         pop r12;

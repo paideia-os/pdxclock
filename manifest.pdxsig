@@ -1,10 +1,14 @@
 # pdxclock — manifest.pdxsig
 #
-# Dual-signed package manifest source-form for `pdxclock` v1.1.0.
+# Dual-signed package manifest source-form for `pdxclock` v1.2.0 (adds
+# the v1.1-B semantic-pipe emission wire, pdxclock#9, on top of the
+# v1.1.0 Track C release closer, pdxclock#10). Bumped to 1.2.0 rather
+# than 1.1.0 since v1.1.0 is already tagged in this repo's history.
 #
 # Wave:  R102 (design/graphics/r102-user-plan.md, paideia-os monorepo);
-#        this release closes Track C's v1.1 pass (pdxclock#10, MASTER_PLAN.md
-#        org-wide milestone alignment across 12 mature satellites).
+#        v1.1.0 closed Track C's v1.1 pass (pdxclock#10, MASTER_PLAN.md
+#        org-wide milestone alignment across 12 mature satellites);
+#        this v1.2.0 release adds pdxclock#9's semantic-pipe wire.
 # Doc:   design/tooling/plan.md §D4 + §6.2-§6.4 for the two-key
 #        ML-DSA-65 dual-signature shape this manifest follows
 #        (author key + Paideia root re-sign key).
@@ -18,25 +22,29 @@
 # still carries the literal `PENDING`, and content hashes use interim
 # sha2-256 rather than the eventual on-wire sha3-256.
 #
-# v1.1.0 (pdxclock#10, Track C release closer) is a DOCS/RELEASE-ONLY
-# bump on top of v1.0.0-src: no src/ or tests/ file changes. The tag is
-# now a bare `v1.1.0` (not `-src`) per the precedent set by this org's
-# other mature satellites (e.g. pdxtrust v1.1.0) -- the manifest's
-# unsigned status is fully documented in this header and in
-# §6/§7 below rather than encoded into the tag string, since every
-# post-1.0 satellite in the org ships pre-v0.33 with the same PENDING
-# posture and a per-tag naming convention would be redundant with it.
+# R102.M5-001 ("signed 1.0.0 release", paideia-os/pdxclock#7) landed
+# all five R102 milestones (M1..M5) in source form at v1.0.0-src.
+# v1.1.0 (pdxclock#10, Track C release closer) was a DOCS/RELEASE-ONLY
+# bump on top of that -- no src/ or tests/ file changes -- and
+# established a bare `vX.Y.Z` tag convention (no `-src` suffix) for
+# this org's mature satellites, since the unsigned status is already
+# fully documented in this header and in §6/§7 below. v1.2.0
+# (pdxclock#9) adds the post-1.0 v1.1-B semantic-pipe emission wire on
+# top of that close, following the same bare-tag convention. The dual
+# ML-DSA-65 signature blocks below remain PENDING until paideia-as
+# v0.33 crypto lands — `pkg install --strict` refuses this package
+# until a release runner replaces both PENDING blocks in place.
 
 # ---------------------------------------------------------------
 # §1 Package identity
 # ---------------------------------------------------------------
 package:
   name:              pdxclock
-  version:           1.1.0
-  wave:              R102 (M1-001 .. M5-001) + Track C release closer (#10)
+  version:           1.2.0
+  wave:              R102 (M1-001 .. M5-001) + Track C closer (#10) + v1.1-B semantic-pipe (#9)
   category:          G  # Graphical userland (r102-user-plan.md app catalogue)
   release_date:      2026-09-13
-  git_tag:           v1.1.0
+  git_tag:           v1.2.0
   git_repo:          github.com/paideia-os/pdxclock
   license:           MIT
   paideia_as_target: v0.21          # min toolchain per tools/build.sh's own floor
@@ -77,6 +85,8 @@ content_hashes:
       hash: TBD-RECOMPUTED-AT-SIGN
     - path: src/render.pdx
       hash: TBD-RECOMPUTED-AT-SIGN
+    - path: src/pipe_emit.pdx
+      hash: TBD-RECOMPUTED-AT-SIGN
     - path: src/close.pdx
       hash: TBD-RECOMPUTED-AT-SIGN
     - path: src/pdxclock.pdx
@@ -89,7 +99,13 @@ content_hashes:
 # ---------------------------------------------------------------
 # §5 Declared output schemas
 # ---------------------------------------------------------------
-declared_output_schemas: (none)
+# As of v1.2.0 (pdxclock#9), one schema: ClockTickRecord@0.1,
+# emitted via sys_semantic_send (sysno 115) once per render tick
+# (src/pipe_emit.pdx PipeEmit::pipe_emit_send, called from src/render.pdx
+# Render::render_run_tick). See caps.decl's declares_output_schemas:
+# for the same entry.
+declared_output_schemas:
+  - ClockTickRecord@0.1 (schema=0x436C6B5469636B01, len=128, via=sys_semantic_send)
 
 # ---------------------------------------------------------------
 # §6 Author signature — first of two ML-DSA-65 signatures

@@ -1,0 +1,252 @@
+// src/pipe_emit.pdx -- pdxclock#9 (v1.1-B semantic-pipe emission wire).
+// PipeEmit module: ClockTickRecord@0.1 emission via sys_semantic_send
+// (sysno 115) on every render tick.
+//
+// Scope
+// -----
+// pdxclock has never emitted anything to the kernel-side semantic-pipe
+// ring (sys_semantic_send, sysno 115, R107-M0-001 / paideia-os#2350).
+// This lands one best-effort emission per `Render::render_run_tick`
+// cycle (src/render.pdx, landed for pdxclock#3), right after the
+// tick's own `_render_last_tick_ns` update -- one `ClockTickRecord@0.1`
+// per rendered HH:MM:SS frame, matching this issue's literal "emit ...
+// per render tick" scope. `pdxpaint`'s own src/pipe_emit.pdx
+// (pdxpaint#12) and `cat`'s src/pipe_emit.pdx (cat#29) are the direct
+// shape precedents this file follows: same sysno, same "marshal into a
+// static .bss buffer, rdtsc for a timestamp, syscall, discard the
+// return" structure.
+//
+// hour/minute/second decomposition
+// ---------------------------------
+// `Render::format_hms` (src/render.pdx) already performs the exact
+// `(ns/1e9) mod 86400` -> hh/mm/ss decomposition this record needs, but
+// keeps hh/mm/ss as function-local temporaries (r9/r10/r11) that are
+// immediately re-purposed for ASCII-digit formatting into `_render_
+// out_buf` -- there is no raw-integer hh/mm/ss value exposed across
+// that call boundary to reuse without changing format_hms's own
+// signature (a change every other consumer of that leaf would then
+// have to account for). `pipe_emit_send` therefore re-runs the
+// identical four-div decomposition independently, over the SAME
+// `ns_since_boot` reading `render_run_tick` already holds in `r13`
+// (the post-wait `clock_read_ns()` result) -- a small, self-contained
+// duplication that keeps this file decoupled from format_hms's own
+// internal register/output-buffer contract, the same posture cat's
+// pipe_emit.pdx keeps its own hashing self-contained rather than
+// reaching into src/entry.pdx's accumulator internals.
+//
+// Record layout -- ClockTickRecord@0.1, 128 bytes @align(8)
+// -------------------------------------------------------------
+//   [ +0] version_op     u64  -- version (low u32) | op (high u32) << 32
+//                                bit-packed into ONE 8-byte slot (no
+//                                native 32-bit-wide store in this
+//                                toolchain -- see pdxpaint/cat's own
+//                                pipe_emit.pdx files for the same
+//                                note). version = CLOCK_TICK_VERSION
+//                                (1). op = CLOCK_TICK_OP_TICK (1) --
+//                                the one opcode this v0.1 shape
+//                                defines ("one render tick completed").
+//   [ +8] hour            u64  -- decoded hh, 0..23.
+//   [+16] minute          u64  -- decoded mm, 0..59.
+//   [+24] second          u64  -- decoded ss, 0..59.
+//   [+32] ns_since_boot   u64  -- the raw `sys_clock_read_ns` reading
+//                                this tick rendered from (render_run_
+//                                tick's `r13`), BEFORE the `mod 86400`
+//                                day-wrap -- the full monotonic value,
+//                                so a downstream consumer can detect
+//                                day-boundary wraps the hh/mm/ss fields
+//                                alone cannot distinguish.
+//   [+40] timestamp_ticks u64  -- raw TSC snapshot via `rdtsc` at EMIT
+//                                time (distinct from ns_since_boot,
+//                                which is the render's own HPET-backed
+//                                clock source, sampled slightly
+//                                earlier in the same tick). Same
+//                                rax=low32/rdx=high32 + `shl rdx,32; or
+//                                rax,rdx` reconstruction idiom as every
+//                                other pipe_emit.pdx in this tree.
+//   [+48] reserved[10]    u64x10 -- zeroed. 48 + 8*10 = 128 bytes total,
+//                                matching this issue's literal "128B
+//                                ClockTickRecord" spec exactly (same
+//                                RESERVED_WORDS=10 derivation cat's own
+//                                pipe_emit.pdx documents for its
+//                                identically-sized record).
+//
+// Schema tag
+// ----------
+// CLOCK_TICK_SCHEMA_TAG identifies this record's WIRE SHAPE to the
+// ring's consumer. Derived exactly like pdxpaint's PAINT_SAVE_SCHEMA_
+// TAG / cat's CAT_PIPE_SCHEMA_TAG / cp's COPY_RECORD_SCHEMA: pack the
+// ASCII bytes of a 7-character family name ("ClkTick") followed by a
+// version byte (0x01) into one big-endian-written u64 literal
+// (little-endian in memory -- byte 0 = 0x01, bytes 1..7 = the family
+// name in forward order at increasing addresses):
+//   0x43 'C' 6C 'l' 6B 'k' 54 'T' 69 'i' 63 'c' 6B 'k' 01  =>
+//   CLOCK_TICK_SCHEMA_TAG = 0x436C6B5469636B01
+//
+// paideia-as compliance (v0.36+, matching this repo's own MIN_VERSION
+// floor of 0.21.0 for pre-existing files but written against the same
+// >=0.36 curried-arg / div/sub-register-form baseline pdxpaint targets)
+// -------------------------------------------------------------------
+//   - Module PipeEmit (PascalCase basename matches src/pipe_emit.pdx).
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0` (none
+//     needed in this file -- no branches at all).
+//   - No `and rN, imm64` on r8-r15 (no ANDs).
+//   - No 2-op `imul r, imm` and no multiply of any shape -- the hh/mm/
+//     ss decomposition is DIVISION by compile-time constants only
+//     (1_000_000_000 / 86400 / 3600 / 60), mirroring Render::format_
+//     hms's own note that this tree's imul-avoidance convention
+//     targets constant MULTIPLIES, not divisions.
+//   - No `neg` mnemonic.
+//   - No `qword ptr` / `dword ptr` Intel sizing -- plain `mov [mem], reg`.
+//   - Reserved-label discipline: no branch labels in this file, so no
+//     prefix is required (mirrors cp's own pipe.pdx note on this
+//     point) -- pipe_emit_send is a single straight-line block.
+//   - Three callee-save pushes (r12/r13/r14) preserve render_run_
+//     tick's own live r12/r13 values across this call (see call-site
+//     note in src/render.pdx) even though this leaf issues no nested
+//     `call` itself (only `div`/`rdtsc`/`syscall`, none of which touch
+//     r12-r14) -- the SysV callee-save CONTRACT, not this leaf's own
+//     internal needs, is what obligates the push/pop bracket.
+
+module PipeEmit = structure {
+
+  // -- Syscall id -------------------------------------------------------
+  // R107-M0-001 (paideia-os #2350). Mirrors pdxpaint/cat/cp's own
+  // pipe_emit modules and src/kernel/core/syscall/handlers/
+  // sys_semantic_send.pdx.
+  pub let SYSCALL_SEMANTIC_SEND : u64 = 115
+
+  // -- Record shape constants --------------------------------------------
+  pub let CLOCK_TICK_RECORD_LEN : u64 = 128
+  pub let CLOCK_TICK_VERSION    : u64 = 1
+  pub let CLOCK_TICK_OP_TICK    : u64 = 1
+
+  // -- Schema tag ---------------------------------------------------------
+  // See module header for the derivation ("ClkTick" + 0x01 version byte).
+  pub let CLOCK_TICK_SCHEMA_TAG : u64 = 0x436C6B5469636B01
+
+  // -- Record scratch buffer (.bss, single global) -------------------------
+  // sys_semantic_send copies the record bytes into the kernel's ring
+  // synchronously, so this buffer is safe to reuse on the very next
+  // tick's emission without a barrier.
+  pub let mut pipe_emit_record_buf : [u8; 128] = uninit @align(8)
+
+  // ============================================================================
+  // pipe_emit_send(ns_since_boot) -> discarded rax
+  //
+  // Signature: pipe_emit_send : (u64) -> u64 !{mem, sysreg} @{}
+  //   RDI (input):  ns_since_boot -- render_run_tick's `r13`, the
+  //                 post-wait sys_clock_read_ns() reading this tick
+  //                 rendered from.
+  //   RAX (output): the syscall's return value verbatim (caller
+  //                 discards -- best-effort emission, same posture as
+  //                 pdxpaint/cp/cat's own pipe_emit leaves).
+  //
+  // Marshals the 128-byte ClockTickRecord@0.1 into `pipe_emit_record_
+  // buf`, then invokes sys_semantic_send. Three callee-save pushes
+  // (r12/r13/r14) preserve the caller's own live r12/r13 across this
+  // call (see module header); this leaf issues no nested `call` itself
+  // (only `div`/`rdtsc`/`syscall`), so the push/pop bracket exists
+  // purely to satisfy the SysV callee-save contract, not any internal
+  // alignment need.
+  //
+  // Register plan:
+  //   r12 = ns_since_boot, stashed off rdi before any div clobbers rax/
+  //         rdx, survives to the +32 store and to the final syscall
+  //   r13 = day_seconds / rem1 scratch across the decomposition steps
+  //   r14 = `lea` scratch for the record-buffer base, reloaded before
+  //         every store per the project's r11-scratch convention
+  //         (r14 used here instead of r11 since r11 is SYSCALL-
+  //         clobbered and this function's last write to the buffer --
+  //         the reserved-zeroing block -- happens AFTER no syscall has
+  //         fired yet, but keeping one consistent scratch register for
+  //         every lea in this leaf, rather than mixing r11/r14, reads
+  //         more clearly)
+  //   rax/rdx/rcx = div quotient/remainder/divisor scratch, rdtsc
+  //         low/high halves, final syscall id+return
+  // ============================================================================
+  pub let pipe_emit_send : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (ns_since_boot: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {},
+      justification: "pdxclock#9 pipe_emit_send. Three callee-save pushes (r12, r13, r14) preserve render_run_tick's own live r12 (_render_last_tick_ns, no longer read past this point in the caller but still a live register slot per SysV callee-save contract) and r13 (`now`, read again by the caller AFTER this call returns, to store into _render_last_tick_ns) -- this leaf must not clobber either. r12 := rdi (ns_since_boot), kept live across every div step below. (1) version_op = CLOCK_TICK_VERSION | (CLOCK_TICK_OP_TICK << 32) via mov+shl+or, stored @+0. (2) Four-step div decomposition, IDENTICAL arithmetic to Render::format_hms (division by compile-time constants only, not multiplication -- this tree's imul-avoidance convention does not apply): rax=r12/1_000_000_000 (total_seconds); xor rdx,rdx; div 86400 -> rdx=day_seconds (stashed in r13); rax=r13/3600 -> hh (stored @+8), rdx=rem1 (restashed in r13); rax=r13/60 -> mm (stored @+16), rdx=ss (stored @+24). (3) ns_since_boot (r12, the ORIGINAL full value, pre-mod) stored @+32. (4) rdtsc -> rax=low32/rdx=high32; `shl rdx,32; or rax,rdx` reconstructs the 64-bit tick counter; stored @+40 (timestamp_ticks). (5) Zero the 10-qword reserved region @+48..+120 via ten explicit `mov [r14+N], rax` stores (rax already holds tsc_ticks at this point, so an explicit `xor rax,rax` precedes the zeroing block). (6) sys_semantic_send(CLOCK_TICK_SCHEMA_TAG, &pipe_emit_record_buf, 128): rdi=schema tag via movabs (> 0x7FFFFFFF), rsi=lea of the buffer, rdx=128, rax=115 (SYSCALL_SEMANTIC_SEND), syscall. Return value verbatim; caller (Render::render_run_tick) discards it -- both failure classes (-EFAULT bad record_ptr, -EINVAL out-of-range len) would be marshalling bugs in this file, not per-tick conditions the caller can act on, matching every other pipe_emit leaf in this tree's precedent. No nested `call` anywhere in this body -- only `div`/`rdtsc`/`syscall` -- so the three-push bracket exists solely to satisfy the SysV callee-save contract for r12/r13, not for call-site alignment (though it happens to also land rsp%16=0, immaterial since no further `call` fires). No test rN,rN (no branches at all in this file). No and rN,imm64. No 2-op imul (four divs, zero multiplies). No neg. Every immediate besides the movabs schema tag fits imm32 (1_000_000_000 max). Labels: none needed (straight-line leaf, no branches).",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                       // r12 = ns_since_boot
+
+        // ---- (1) version_op = version | (op << 32) -----------------------
+        mov rax, 1;                         // CLOCK_TICK_VERSION
+        mov rcx, 1;                         // CLOCK_TICK_OP_TICK
+        shl rcx, 32;
+        or rax, rcx;
+        lea r14, [rip + pipe_emit_record_buf];
+        mov [r14 + 0], rax;
+
+        // ---- (2) hh/mm/ss decomposition (mirrors Render::format_hms) -----
+        mov rax, r12;
+        xor rdx, rdx;
+        mov rcx, 1000000000;
+        div rcx;                            // rax = total_seconds
+
+        xor rdx, rdx;
+        mov rcx, 86400;
+        div rcx;                            // rdx = day_seconds
+        mov r13, rdx;
+
+        mov rax, r13;
+        xor rdx, rdx;
+        mov rcx, 3600;
+        div rcx;                            // rax = hh, rdx = rem1
+        lea r14, [rip + pipe_emit_record_buf];
+        mov [r14 + 8], rax;                 // hour
+        mov r13, rdx;                       // rem1
+
+        mov rax, r13;
+        xor rdx, rdx;
+        mov rcx, 60;
+        div rcx;                            // rax = mm, rdx = ss
+        lea r14, [rip + pipe_emit_record_buf];
+        mov [r14 + 16], rax;                // minute
+        mov [r14 + 24], rdx;                // second
+
+        // ---- (3) ns_since_boot (original, pre-mod) @+32 -------------------
+        lea r14, [rip + pipe_emit_record_buf];
+        mov [r14 + 32], r12;
+
+        // ---- (4) rdtsc -> full 64-bit tick counter @+40 -------------------
+        rdtsc;
+        shl rdx, 32;
+        or rax, rdx;
+        lea r14, [rip + pipe_emit_record_buf];
+        mov [r14 + 40], rax;                // timestamp_ticks
+
+        // ---- (5) zero reserved[10] @+48..+120 -------------------------------
+        xor rax, rax;
+        lea r14, [rip + pipe_emit_record_buf];
+        mov [r14 + 48], rax;
+        mov [r14 + 56], rax;
+        mov [r14 + 64], rax;
+        mov [r14 + 72], rax;
+        mov [r14 + 80], rax;
+        mov [r14 + 88], rax;
+        mov [r14 + 96], rax;
+        mov [r14 + 104], rax;
+        mov [r14 + 112], rax;
+        mov [r14 + 120], rax;
+
+        // ---- (6) sys_semantic_send(CLOCK_TICK_SCHEMA_TAG, buf, 128) --------
+        mov rdi, 0x436C6B5469636B01;        // CLOCK_TICK_SCHEMA_TAG (movabs)
+        lea rsi, [rip + pipe_emit_record_buf];
+        mov rdx, 128;                       // CLOCK_TICK_RECORD_LEN
+        mov rax, 115;                       // SYSCALL_SEMANTIC_SEND
+        syscall;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}

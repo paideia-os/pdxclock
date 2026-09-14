@@ -30,29 +30,33 @@ Every issue is filed against one of these five milestones; see the Issues tab.
 
 ## Status
 
-`v1.1.0` is the Track C release closer (pdxclock#10) on top of
-`v1.0.0-src`: no `src/` or `tests/` file changes, just the version
-bump, this Status section, `CHANGELOG.md`'s `[1.1.0]` entry, and the
-`manifest.pdxsig` re-stamp. All five R102 milestones remain landed as
-of `v1.0.0-src`: `caps.decl`, argv (`--x=`/`--y=`), window-open request
-against svc.compositor (`src/window.pdx`), the HH:MM:SS render loop
-(`src/render.pdx`), WindowRecord CLOSING handling (`src/close.pdx`),
-the seeded-time regression (`tests/pdxclock_seeded_time_smoke.pdx`),
-and the close-on-WM-quit smoke (`tests/pdxclock_wm_quit_smoke.pdx`).
+`v1.2.0` lands the post-1.0 v1.1-B semantic-pipe emission wire
+(pdxclock#9) on top of `v1.1.0`, the Track C release closer
+(pdxclock#10, a docs-only bump over `v1.0.0-src` — no `src/` or
+`tests/` changes there). Bumped to 1.2.0 rather than 1.1.0 since
+`v1.1.0` is already tagged in this repo's history. All five R102
+milestones remain landed as of `v1.0.0-src`: `caps.decl`, argv
+(`--x=`/`--y=`), window-open request against svc.compositor
+(`src/window.pdx`), the HH:MM:SS render loop (`src/render.pdx`),
+WindowRecord CLOSING handling (`src/close.pdx`), the seeded-time
+regression (`tests/pdxclock_seeded_time_smoke.pdx`), and the
+close-on-WM-quit smoke (`tests/pdxclock_wm_quit_smoke.pdx`) — plus, as
+of this release, every render tick emitting a 128-byte
+`ClockTickRecord@0.1` via `sys_semantic_send` (`src/pipe_emit.pdx`).
 svc-compositor, libpdx-gfx, libpdx-font, and libpdx-event are still not
-yet landed satellites, so the window-open handshake speaks a documented
-provisional wire and the render "blit" is a WEAK debug-channel stub —
-see each file's header for the exact one-function swap a future
-landing needs.
+yet landed satellites, so the window-open handshake speaks a
+documented provisional wire and the render "blit" is a WEAK
+debug-channel stub — see each file's header for the exact
+one-function swap a future landing needs.
 
 This remains a SOURCE-FORM release: `manifest.pdxsig`'s dual
 ML-DSA-65 signature blocks are `PENDING` pending paideia-as v0.33's
 crypto intrinsics, the svc.signing-bot broker, and the pkgs.paideia-os
 host (T-INFRA-001/002) — `pkg install --strict` refuses this package
 until a release runner fills both blocks in. Same posture every other
-satellite in this org ships pre-v0.33; the tag is a bare `v1.1.0` per
-the naming convention this org's other post-1.0 satellites (e.g.
-pdxtrust) now use, rather than an `-src` suffix.
+satellite in this org ships pre-v0.33; the tag is a bare `v1.2.0` per
+the naming convention `v1.1.0`'s Track C closer established for this
+org's post-1.0 satellites, rather than an `-src` suffix.
 
 Repo shape mirrors R100 satellites: `caps.decl` at root, `src/` module
 tree, `tests/`, `manifest.pdxsig` (source-form; real signatures land
