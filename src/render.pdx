@@ -39,17 +39,16 @@
 //
 // 1 Hz cadence
 // ------------
-// `render_run_tick` is deliberately delta-based rather than a fixed
-// sleep syscall — paideia-os has no `nanosleep`/`sys_clock_ticks`
-// syscall at HEAD (design/user/syscall-table.md has no such row); the
-// only primitive available is the same nullary `sys_clock_read_ns`
-// used for the render source. `_render_last_tick_ns` (0 = "never
-// ticked") gates a busy-wait: on the second and later calls,
-// render_run_tick spins re-reading the clock until >= 1_000_000_000 ns
-// have elapsed since the previous tick before rendering again. This
-// also bounds src/close.pdx's CLOSING-poll latency to ~1s, matching
-// R102.M4-002's "exits within one second (event_poll cadence)" smoke
-// contract even though libpdx-event itself is not linked here.
+// pdxclock Wave eps-03: `render_run_tick` now paces itself with the
+// real `sys_sched_wait_ns` syscall (SC+ 116) instead of a busy-wait
+// spin on `sys_clock_read_ns`. `_render_last_tick_ns` (0 = "never
+// ticked") still gates the very first call: on the first call,
+// render_run_tick renders immediately with no wait; on every later
+// call it blocks for exactly 1_000_000_000 ns via `sched_wait_ns`
+// before rendering again. This also bounds src/close.pdx's
+// CLOSING-poll latency to ~1s, matching R102.M4-002's "exits within
+// one second (event_poll cadence)" smoke contract even though
+// libpdx-event itself is not linked here.
 //
 // paideia-as compliance: module basename PascalCase (`Render`); no
 // `test rN,rN` (every zero/threshold check is `cmp reg, imm`); no
@@ -92,6 +91,27 @@ module Render = structure {
       justification: "pdxclock.M2-001 (#3) clock_read_ns trampoline. Real nullary syscall (sysno 66 = SYS_CLOCK_READ_NS, design/user/syscall-table.md row 66). No argument registers -- the body tail-calls hpet_now_ns kernel-side and returns u64 ns-since-boot in rax unconditionally (no errno path per the table row's own note). Leaf; sysreg effect for the SYSRET rcx/r11 clobber. Declared KIND_CLOCK in caps.decl is documentary only -- this syscall is uncapped at HEAD (see caps.decl's substrate-posture note).",
       block: {
         mov rax, 66;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sched_wait_ns(ns) -> u64
+  //
+  // Real syscall (SC+ 116, Wave UUU / SC+116 sys_sched_wait_ns). Arity 1
+  // (ns=rdi passes straight through, no r10 shuffle needed). Blocks the
+  // calling task for approximately `ns` nanoseconds and returns u64
+  // (actual elapsed ns, per the syscall-table row) in rax. Replaces the
+  // former clock_read_ns busy-wait cadence (see render_run_tick header).
+  // ==========================================================================
+  pub let sched_wait_ns : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (ns: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {},
+      justification: "pdxclock Wave eps-03 (#sys_sched_wait_ns integration) sched_wait_ns trampoline. Real syscall (sysno 116 = SYS_SCHED_WAIT_NS, design/user/syscall-table.md row 116). Arity 1 -- rdi already holds `ns` verbatim from the SysV entry, no register shuffle and no r10 relocation needed (only 4+ arg syscalls need the rcx-clobber workaround). Leaf; sysreg effect for the SYSRET rcx/r11 clobber. Mirrors clock_read_ns's zero-prologue leaf shape exactly, one argument register added.",
+      block: {
+        mov rax, 116;
         syscall;
         ret
       }
@@ -224,17 +244,15 @@ module Render = structure {
   // render_run_tick() -> ()
   //
   // One cycle of the 1 Hz loop: on the first call, render immediately;
-  // on every later call, busy-wait (re-reading clock_read_ns) until
-  // >= 1s has elapsed since the previous tick, THEN render. Updates
-  // _render_last_tick_ns to the post-wait reading before returning, so
-  // drift does not accumulate across calls beyond one clock_read_ns
-  // granularity.
+  // on every later call, block via `sched_wait_ns(1_000_000_000)`
+  // (SC+ 116) before rendering again. Updates _render_last_tick_ns to
+  // the post-wait clock_read_ns reading before returning.
   // ==========================================================================
   pub let render_run_tick : () -> () !{mem, sysreg} @{} =
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {},
-      justification: "pdxclock.M2-001 (#3) render_run_tick, extended by pdxclock#9 (semantic-pipe emission). 1-push prologue (rbx unused across calls here -- kept for parity; r12 holds _render_last_tick_ns's cached value, r13 holds the just-read `now`). rsp%16 entry 8 -> push rbx (0) -> push r12 (8) -> push r13 (0), stable 0 for every nested call (clock_read_ns / format_hms / blit_stub / pipe_emit_send). rnd_wait_top: call clock_read_ns -> r13=now. cmp r12,0; je rnd_render (first tick: r12==0 sentinel skips the wait). Otherwise compute elapsed = r13 - r12 via `mov rax,r13; sub rax,r12`; cmp rax,1000000000; jl rnd_wait_top (busy-wait: re-read the clock and retry). rnd_render: call format_hms(r13, &_render_out_buf); call blit_stub(&_render_out_buf, 8); store r13 into _render_last_tick_ns; call pipe_emit_send(r13) (pdxclock#9 -- emits one ClockTickRecord@0.1 for this tick's `now` reading; PipeEmit::pipe_emit_send itself preserves r12/r13 via its own three-push callee-save bracket, so both survive this call untouched even though r12 is no longer read past this point and r13 is not read again either, since the store already happened); pop r13/r12/rbx; ret. No test rN,rN (elapsed check is cmp rax,imm). All immediates fit imm32 (1_000_000_000 max, 8 min). Labels prefixed rnd_.",
+      justification: "pdxclock.M2-001 (#3) render_run_tick, extended by pdxclock#9 (semantic-pipe emission) and pdxclock Wave eps-03 (sys_sched_wait_ns cadence). 1-push prologue (rbx unused across calls here -- kept for parity; r12 holds _render_last_tick_ns's cached value, r13 holds the just-read `now`). rsp%16 entry 8 -> push rbx (0) -> push r12 (8) -> push r13 (0), stable 0 for every nested call (sched_wait_ns / clock_read_ns / format_hms / blit_stub / pipe_emit_send). cmp r12,0; je rnd_first (first tick: r12==0 sentinel skips the wait). Otherwise mov rdi,1000000000; call sched_wait_ns blocks for exactly 1s (replacing the former busy-wait spin on clock_read_ns). rnd_first: call clock_read_ns -> r13=now. rnd_render: call format_hms(r13, &_render_out_buf); call blit_stub(&_render_out_buf, 8); store r13 into _render_last_tick_ns; call pipe_emit_send(r13) (pdxclock#9 -- emits one ClockTickRecord@0.1 for this tick's `now` reading; PipeEmit::pipe_emit_send itself preserves r12/r13 via its own three-push callee-save bracket, so both survive this call untouched even though r12 is no longer read past this point and r13 is not read again either, since the store already happened); pop r13/r12/rbx; ret. No test rN,rN. No and rN,imm64. All immediates fit imm32 (1_000_000_000 max, 8 min). Labels prefixed rnd_.",
       block: {
         push rbx;                             // rsp%16: 8 -> 0 (parity pad)
         push r12;                             // rsp%16: 0 -> 8
@@ -243,19 +261,16 @@ module Render = structure {
         lea rax, [rip + _render_last_tick_ns];
         mov r12, [rax];                       // r12 = last tick (0 = never)
 
-      rnd_wait_top:
+        cmp r12, 0;
+        je  rnd_first;                        // first tick: no wait
+
+        mov rdi, 1000000000;                  // 1s in ns
+        call sched_wait_ns;
+
+      rnd_first:
         call clock_read_ns;
         mov r13, rax;                         // r13 = now
 
-        cmp r12, 0;
-        je  rnd_render;                       // first tick: no wait
-
-        mov rax, r13;
-        sub rax, r12;                         // rax = elapsed ns
-        cmp rax, 1000000000;
-        jl  rnd_wait_top;
-
-      rnd_render:
         mov rdi, r13;
         lea rsi, [rip + _render_out_buf];
         call format_hms;
